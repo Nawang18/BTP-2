@@ -1,0 +1,496 @@
+"""Demo 3 -- Vision-Guided Autonomous Multi-Brick Wall Assembly with 3D/6D Tilt Grasping.
+
+Features:
+1. Flexible Brick Input:
+   - Manual coordinates via CLI: --coords "0.46,-0.10,15; 0.50,0.10,-10; 1.25,0.50,0"
+   - Supports 3D angle / tilt: --coords "0.48,-0.10,15,12; 0.50,0.10,-10,0" (X, Y, Yaw, Pitch, Roll)
+   - Single brick flags: --x 0.46 --y -0.10 --yaw_deg 15 --pitch_deg 12
+   - Interactive console input: --interactive (prompts X Y [Yaw] [Pitch] [Roll])
+   - Random reachable workspace spawning: --random (default if no coords given)
+   - Tilted brick demonstration: --demo_tilted (spawns an angled brick on a support wedge)
+2. Automated Reachability Verification:
+   - Checks geometric workspace envelope and IK solver residuals before attempting manipulation.
+   - If a brick is unreachable: outputs "[Warning] Brick X (at X=..., Y=...) is OUT OF REACH of the arm!"
+     and highlights it with a 3D red warning tag in PyBullet.
+3. 3D Computer Vision Perception (OpenCV RGB-D + Point Cloud PCA):
+   - Overhead camera captures RGB-D and extracts real-world 3D coordinates (X, Y, Z).
+   - Point cloud PCA estimates the 3D surface normal vector, tilt angle with ground, and
+     generates a 6D gripper orientation quaternion that tilts the gripper flush with the brick.
+   - Saves annotated detection snapshot to results/demo3_camera_detection.png.
+4. Closed-Loop Pick & Place with 3D Tilted Grasping:
+   - Approaches along the brick's surface normal and tilts the gripper to align with inclined faces.
+   - Closed-loop pick attempts (up to 3x): re-homes and re-scans via camera if grip slips.
+   - Closed-loop place attempts (up to 2x): re-levels the brick to flat on the mortar bed,
+     executing dislodge recovery if stuck in gripper.
+5. Wall Construction & Metrics:
+   - Places mortar beds under each wall slot, logs precision metrics, and saves reports.
+
+Run:
+    python run_demo3_multi_robot.py
+    python run_demo3_multi_robot.py --coords "0.48,-0.10,15,12; 0.50,0.10,-10"
+    python run_demo3_multi_robot.py --demo_tilted
+    python run_demo3_multi_robot.py --interactive
+    python run_demo3_multi_robot.py --nogui
+"""
+import argparse
+import ast
+import math
+import os
+import random
+import re
+import sys
+import time
+
+import numpy as np
+# pyrefly: ignore [missing-import]
+import pybullet as p
+
+from wall_sim.config import Config
+from wall_sim.scene import (
+    build_world, make_brick, make_tilted_brick, make_static_box, draw_slot_outline
+)
+from wall_sim.wall_plan import plan_wall, mortar_center_for
+from wall_sim.robots.panda_arm import (
+    PandaArm, GripFailed, PlaceFailed, gripper_3d_orientation, gripper_down_quaternion
+)
+from wall_sim.camera_vision import OverheadCamera
+from wall_sim import metrics
+
+
+def parse_brick_coords(coords_str: str) -> list:
+    """Parses various coordinate string representations into a list of
+    (x, y, yaw_deg, pitch_deg, roll_deg) tuples.
+    
+    Supported formats:
+      - Semicolon or comma delimited: "0.45,-0.10,15; 0.50,0.12,-20; 1.25,0.50,0"
+      - With tilt (Pitch / Roll): "0.48,-0.10,15,12,0; 0.50,0.10,-10"
+      - Python list of tuples: "[(0.45, -0.10, 15), (0.50, 0.12, -20, 10)]"
+    """
+    coords_str = coords_str.strip()
+    if not coords_str:
+        return []
+
+    # Attempt ast.literal_eval if formatted as a Python list or tuple
+    if coords_str.startswith("[") or coords_str.startswith("("):
+        try:
+            parsed = ast.literal_eval(coords_str)
+            result = []
+            for item in parsed:
+                x = float(item[0])
+                y = float(item[1])
+                yaw = float(item[2]) if len(item) > 2 else 0.0
+                pitch = float(item[3]) if len(item) > 3 else 0.0
+                roll = float(item[4]) if len(item) > 4 else 0.0
+                result.append((x, y, yaw, pitch, roll))
+            return result
+        except Exception:
+            pass
+
+    # Split by semicolon first, or by newline, or by grouped parentheses
+    parts = re.split(r"[;\n]", coords_str)
+    result = []
+    for part in parts:
+        part = part.strip().strip("()[]")
+        if not part:
+            continue
+        tokens = [t.strip() for t in re.split(r"[, \t]+", part) if t.strip()]
+        if len(tokens) >= 2:
+            x = float(tokens[0])
+            y = float(tokens[1])
+            yaw = float(tokens[2]) if len(tokens) > 2 else 0.0
+            pitch = float(tokens[3]) if len(tokens) > 3 else 0.0
+            roll = float(tokens[4]) if len(tokens) > 4 else 0.0
+            result.append((x, y, yaw, pitch, roll))
+
+    return result
+
+
+def prompt_interactive_coords() -> list:
+    """Interactively prompts the user in the terminal to enter brick coordinates."""
+    print("\n--- Interactive Brick Coordinates Input ---")
+    print("Format: X Y [Yaw_deg] [Pitch_deg (tilt)] [Roll_deg]")
+    print("Examples:")
+    print("  '0.48 -0.10 15'       -> Flat on ground, rotated 15 deg yaw")
+    print("  '0.48 -0.10 15 12'    -> Tilted 12 deg pitch, rotated 15 deg yaw")
+    print("  '1.25  0.50  0'       -> Out-of-reach brick test")
+    print("Press Enter without input on an empty line when finished.\n")
+
+    coords = []
+    idx = 1
+    while True:
+        try:
+            line = input(f"Enter Brick #{idx} coordinates (or Enter to finish): ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        parsed = parse_brick_coords(line)
+        if parsed:
+            for item in parsed:
+                coords.append(item)
+                tilt_str = f", Pitch(tilt)={item[3]:.1f}°" if item[3] != 0 else ""
+                print(f"  -> Added Brick #{idx}: X={item[0]:.3f}m, Y={item[1]:.3f}m, Yaw={item[2]:.1f}°{tilt_str}")
+                idx += 1
+        else:
+            print("  [!] Invalid format. Please enter at least X and Y numbers (e.g. 0.48 -0.10 15).")
+
+    return coords
+
+
+def generate_random_coords(count: int, cfg: Config, include_unreachable: bool = False,
+                           include_tilted: bool = False) -> list:
+    """Generates random reachable coordinates within the staging zone."""
+    coords = []
+    for k in range(count):
+        rx = random.uniform(*cfg.spawn_x_range)
+        ry = random.uniform(*cfg.spawn_y_range)
+        ryaw = random.uniform(-35.0, 35.0)
+        # If include_tilted, tilt the first brick by ~12 deg pitch
+        rpitch = 12.0 if (include_tilted and k == 0) else 0.0
+        coords.append((rx, ry, ryaw, rpitch, 0.0))
+
+    if include_unreachable:
+        coords.append((1.25, 0.45, 0.0, 0.0, 0.0))
+
+    return coords
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Demo 3: Vision-Guided Multi-Brick Pick & Place with 3D Tilted Grasping & Reachability Check"
+    )
+    ap.add_argument("--coords", type=str, default=None,
+                    help="Manual coordinates: '0.46,-0.10,15; 0.50,0.10,-10,12; 1.25,0.50,0'")
+    ap.add_argument("--interactive", action="store_true",
+                    help="Prompt in terminal for brick coordinates interactively")
+    ap.add_argument("--x", type=float, default=None, help="Manual single brick X position (m)")
+    ap.add_argument("--y", type=float, default=None, help="Manual single brick Y position (m)")
+    ap.add_argument("--yaw_deg", type=float, default=None, help="Manual single brick Yaw rotation (degrees)")
+    ap.add_argument("--pitch_deg", type=float, default=None, help="Manual brick Pitch / tilt with ground (degrees)")
+    ap.add_argument("--roll_deg", type=float, default=None, help="Manual brick Roll rotation (degrees)")
+    ap.add_argument("--random", action="store_true", help="Force random brick generation")
+    ap.add_argument("--demo_tilted", action="store_true",
+                    help="Include an angled/tilted brick in random staging to demonstrate 3D tilted grasping")
+    ap.add_argument("--demo_unreachable", action="store_true",
+                    help="Include an out-of-reach brick in random mode to demonstrate error handling")
+    ap.add_argument("--rows", type=int, default=2, help="Number of wall rows to build (default: 2)")
+    ap.add_argument("--bricks", type=int, default=3, help="Bricks per row in wall (default: 3)")
+    ap.add_argument("--speed", type=float, default=None, help="Panda arm cartesian speed (m/s, default 0.15)")
+    ap.add_argument("--nogui", action="store_true", help="Run headless in DIRECT mode")
+    ap.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    args = ap.parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+
+    print("\n" + "=" * 75)
+    print("DEMO 3: VISION-GUIDED AUTONOMOUS MULTI-BRICK WALL ASSEMBLY (6D TILT GRASPING)")
+    print("=" * 75)
+
+    cfg = Config()
+    cfg.wall_rows = args.rows
+    cfg.wall_bricks_per_row = args.bricks
+    if args.speed is not None:
+        cfg.arm_speed = args.speed
+
+    # 1. Determine Brick Input Coordinates
+    brick_inputs = []
+    if args.interactive or (args.coords and args.coords.lower() == "interactive"):
+        brick_inputs = prompt_interactive_coords()
+    elif args.coords is not None:
+        brick_inputs = parse_brick_coords(args.coords)
+    elif args.x is not None or args.y is not None:
+        bx = args.x if args.x is not None else 0.48
+        by = args.y if args.y is not None else -0.10
+        byaw = args.yaw_deg if args.yaw_deg is not None else 0.0
+        bpitch = args.pitch_deg if args.pitch_deg is not None else 0.0
+        broll = args.roll_deg if args.roll_deg is not None else 0.0
+        brick_inputs = [(bx, by, byaw, bpitch, broll)]
+
+    # 2. Wall Plan
+    wall_plan = plan_wall(cfg)
+    total_slots = len(wall_plan)
+    print(f"\n[Wall Plan] Target: {cfg.wall_rows} row(s) x {cfg.wall_bricks_per_row} bricks/row -> {total_slots} wall slots.")
+
+    # If no inputs provided, generate random brick coordinates to fulfill wall slots
+    if not brick_inputs:
+        needed_count = min(total_slots, 4) if not args.random else total_slots
+        brick_inputs = generate_random_coords(
+            needed_count, cfg,
+            include_unreachable=args.demo_unreachable,
+            include_tilted=args.demo_tilted
+        )
+        print(f"[Input Mode] Generated {len(brick_inputs)} random brick staging coordinate(s).")
+    else:
+        print(f"[Input Mode] User provided {len(brick_inputs)} custom coordinate(s).")
+
+    # 3. Build PyBullet Simulation Environment
+    build_world(cfg, gui=not args.nogui)
+
+    # Draw wall slots and prepare mortar beds
+    for slot in wall_plan:
+        draw_slot_outline(slot, cfg)
+        mortar_center = mortar_center_for(slot, cfg)
+        make_static_box(mortar_center,
+                        (slot.length + cfg.brick.gap, cfg.brick.width, cfg.brick.gap),
+                        cfg.mortar_rgba)
+
+    # Initialize Franka Panda Arm
+    arm = PandaArm(cfg)
+    arm.run(arm.home_gen())
+
+    # 4. Physical Spawning & Reachability Verification
+    print("\n" + "-" * 60)
+    print("[Reachability Verification] Checking all candidate brick poses...")
+    print("-" * 60)
+
+    staged_bricks = []
+    brick_height = cfg.brick.height
+    z_pos = brick_height / 2.0
+
+    for i, entry in enumerate(brick_inputs, start=1):
+        bx = float(entry[0])
+        by = float(entry[1])
+        byaw = float(entry[2]) if len(entry) > 2 else 0.0
+        bpitch = float(entry[3]) if len(entry) > 3 else 0.0
+        broll = float(entry[4]) if len(entry) > 4 else 0.0
+
+        yaw_rad = math.radians(byaw)
+        pitch_rad = math.radians(bpitch)
+        roll_rad = math.radians(broll)
+        label = f"B{i}"
+
+        target_pos = (bx, by, z_pos)
+        is_tilted = (abs(bpitch) > 0.01 or abs(broll) > 0.01)
+
+        # Physically spawn brick (with physical wedge support if tilted)
+        if is_tilted:
+            bid = make_tilted_brick(
+                cfg, target_pos, roll=roll_rad, pitch=pitch_rad, yaw=yaw_rad, with_support=True
+            )
+        else:
+            bid = make_brick(cfg, target_pos, yaw=yaw_rad)
+
+        # Compute expected 3D normal and test reachability
+        cand_orn = p.getQuaternionFromEuler((roll_rad, pitch_rad, yaw_rad))
+        rot_mat = np.array(p.getMatrixFromQuaternion(cand_orn)).reshape((3, 3))
+        normal_vec = rot_mat[:, 2]
+        if normal_vec[2] < 0:
+            normal_vec = -normal_vec
+        l_vec = rot_mat[:, 0]
+        gripper_cand_orn = gripper_3d_orientation(normal_vec, l_vec)
+
+        is_reachable, reason = arm.check_reachability(
+            target_pos, orn=gripper_cand_orn, normal=normal_vec
+        )
+
+        tilt_info = f", Tilt(Pitch)={bpitch:.1f}°" if is_tilted else ""
+        if not is_reachable:
+            print(f"  [Warning] Brick {label} (at X={bx:.3f}m, Y={by:.3f}m{tilt_info}) is OUT OF REACH of the arm!")
+            print(f"            Reason: {reason}")
+            if not args.nogui:
+                p.addUserDebugText(f"[OUT OF REACH: {label}]", (bx, by, z_pos + 0.09),
+                                   textColorRGB=[1.0, 0.1, 0.1], textSize=1.2)
+                p.changeVisualShape(bid, -1, rgbaColor=[0.9, 0.2, 0.2, 0.8])
+        else:
+            print(f"  [Reachable] Brick {label} at X={bx:.3f}m, Y={by:.3f}m, Yaw={byaw:.1f}°{tilt_info}: OK")
+            if not args.nogui:
+                p.addUserDebugText(f"{label}", (bx, by, z_pos + 0.07),
+                                   textColorRGB=[0.1, 0.8, 0.2], textSize=1.0)
+
+        staged_bricks.append({
+            "index": i,
+            "label": label,
+            "body_id": bid,
+            "true_pos": target_pos,
+            "true_yaw_deg": byaw,
+            "true_pitch_deg": bpitch,
+            "true_roll_deg": broll,
+            "true_yaw_rad": yaw_rad,
+            "is_tilted": is_tilted,
+            "reachable": is_reachable,
+            "reason": reason
+        })
+
+    # Step simulation so physical poses settle before taking camera snapshot
+    for _ in range(25):
+        p.stepSimulation()
+
+    # 5. Computer Vision Perception (OpenCV RGB-D Camera + 3D Point Cloud PCA)
+    print("\n" + "-" * 60)
+    print("[Vision Perception] Capturing RGB-D image & estimating 3D Surface Normals (PCA)...")
+    print("-" * 60)
+    camera = OverheadCamera(cfg, eye_pos=(0.48, 0.0, 1.15), img_width=640, img_height=640)
+    debug_img_path = os.path.join(cfg.results_dir, "demo3_camera_detection.png")
+
+    try:
+        detected_bricks = camera.detect_all_bricks(debug_save_path=debug_img_path)
+        print(f"[Vision] Detected {len(detected_bricks)} brick(s) via OpenCV & 3D PCA.")
+    except Exception as e:
+        print(f"[Vision Error] Camera detection failed: {e}")
+        detected_bricks = []
+
+    reachable_bricks = [b for b in staged_bricks if b["reachable"]]
+    unreachable_bricks = [b for b in staged_bricks if not b["reachable"]]
+
+    print(f"\n[Site Status] Staged bricks: {len(staged_bricks)} total | "
+          f"{len(reachable_bricks)} reachable | {len(unreachable_bricks)} out of reach.")
+
+    if not reachable_bricks:
+        print("\n[Notice] No reachable bricks available for assembly. Simulation complete.")
+        _wait_for_user_exit(args.nogui, cfg)
+        return
+
+    # Match each reachable physical brick with the closest vision detection
+    for b in reachable_bricks:
+        cur_pos, _ = p.getBasePositionAndOrientation(b["body_id"])
+        tx, ty = cur_pos[0], cur_pos[1]
+        best_det = None
+        best_dist = 999.0
+        for det in detected_bricks:
+            d = math.hypot(det["x"] - tx, det["y"] - ty)
+            if d < best_dist:
+                best_dist = d
+                best_det = det
+
+        if best_det is not None and best_dist < 0.12:
+            b["vision_pose"] = best_det
+            pos_err_mm = best_dist * 1000.0
+            yaw_err_deg = abs(best_det["yaw_deg"] - b["true_yaw_deg"])
+            tilt_deg = best_det.get("tilt_deg", 0.0)
+            print(f"  {b['label']}: 3D Pose X={best_det['x']:.3f}m, Y={best_det['y']:.3f}m, Z={best_det['z']:.3f}m | "
+                  f"Yaw={best_det['yaw_deg']:.1f}°, Tilt={tilt_deg:.1f}° (2D err: {pos_err_mm:.1f} mm)")
+        else:
+            b["vision_pose"] = {
+                "x": tx, "y": ty, "z": cur_pos[2],
+                "yaw": b["true_yaw_rad"], "yaw_deg": b["true_yaw_deg"],
+                "tilt_deg": b["true_pitch_deg"],
+                "normal": [0.0, 0.0, 1.0],
+                "gripper_quat": gripper_down_quaternion(b["true_yaw_rad"])
+            }
+            print(f"  {b['label']}: Vision confidence low; using nominal pose.")
+
+    # 6. Precise Pick & Place Loop with 3D Tilted Grasping & Closed-Loop Recovery
+    print("\n" + "-" * 60)
+    print("[Assembly] Commencing Vision-Guided Pick & Place with 3D Tilt Grasping...")
+    print("-" * 60)
+
+    placements = []
+    MAX_PICK_RETRIES = 3
+    MAX_PLACE_RETRIES = 2
+
+    for idx, brick in enumerate(reachable_bricks):
+        if idx >= len(wall_plan):
+            print(f"\n[Info] Wall plan is full ({len(wall_plan)} slots filled). Remaining bricks left in staging.")
+            break
+
+        slot = wall_plan[idx]
+        bid = brick["body_id"]
+        vpose = brick["vision_pose"]
+
+        print(f"\n>>> Task {idx+1}/{min(len(reachable_bricks), len(wall_plan))}: "
+              f"Assemble {brick['label']} -> Wall Slot {slot.brick_id}")
+
+        # --- A. PICK PHASE (with 3D gripper alignment and retry loop) ---
+        pick_succeeded = False
+        for pick_attempt in range(1, MAX_PICK_RETRIES + 1):
+            tilt_str = f", Tilt={vpose.get('tilt_deg', 0.0):.1f}°" if vpose.get('tilt_deg', 0.0) > 2.0 else ""
+            print(f"  [Pick] Attempt {pick_attempt}/{MAX_PICK_RETRIES} for {brick['label']} "
+                  f"(Target Yaw={vpose['yaw_deg']:.1f}°{tilt_str})...")
+
+            cur_brick_pos, _ = p.getBasePositionAndOrientation(bid)
+            pick_target = (vpose["x"], vpose["y"], cur_brick_pos[2])
+
+            try:
+                arm.run(arm.pick_gen(
+                    bid, pick_target,
+                    yaw=vpose["yaw"],
+                    orn=vpose.get("gripper_quat"),
+                    normal=vpose.get("normal")
+                ))
+                pick_succeeded = True
+                print(f"  [Pick] Success: {brick['label']} grasped and lifted.")
+                break
+            except GripFailed as e:
+                print(f"  [Fault] Grip failed: {e}")
+                if pick_attempt < MAX_PICK_RETRIES:
+                    print("  [Recovery] Retracting arm to home, re-acquiring brick with camera...")
+                    arm.run(arm.home_gen())
+                    for _ in range(15):
+                        p.stepSimulation()
+                    try:
+                        fresh_dets = camera.detect_all_bricks(debug_save_path=debug_img_path)
+                        bpos, _ = p.getBasePositionAndOrientation(bid)
+                        closest = min(fresh_dets, key=lambda d: math.hypot(d["x"] - bpos[0], d["y"] - bpos[1]))
+                        vpose = closest
+                        print(f"  [Recovery] Re-acquired: X={vpose['x']:.3f}m, Y={vpose['y']:.3f}m, "
+                              f"Yaw={vpose['yaw_deg']:.1f}°, Tilt={vpose.get('tilt_deg', 0.0):.1f}°")
+                    except Exception as ve:
+                        print(f"  [Recovery Warning] Vision re-scan note: {ve}")
+                else:
+                    print(f"  [Failure] Exceeded max pick attempts ({MAX_PICK_RETRIES}) for {brick['label']}. Skipping.")
+
+        if not pick_succeeded:
+            arm.run(arm.home_gen())
+            continue
+
+        # --- B. PLACE PHASE (re-levels brick to flat on wall slot) ---
+        place_succeeded = False
+        for place_attempt in range(1, MAX_PLACE_RETRIES + 1):
+            print(f"  [Place] Attempt {place_attempt}/{MAX_PLACE_RETRIES} into Slot {slot.brick_id}...")
+            try:
+                arm.run(arm.place_gen(slot.center, yaw=slot.yaw))
+                place_succeeded = True
+                print(f"  [Place] Success: Brick placed onto slot {slot.brick_id}.")
+                break
+            except PlaceFailed as e:
+                print(f"  [Fault] Place issue: {e}")
+                if place_attempt < MAX_PLACE_RETRIES:
+                    print("  [Recovery] Brick stuck in gripper. Executing dislodge maneuver...")
+                    try:
+                        arm.run(arm.dislodge_gen(slot.center, yaw=slot.yaw))
+                        place_succeeded = True
+                        break
+                    except PlaceFailed as de:
+                        print(f"  [Recovery Warning] Dislodge attempt failed: {de}")
+                else:
+                    print(f"  [Failure] Exceeded max place attempts for slot {slot.brick_id}.")
+
+        if place_succeeded:
+            rec = metrics.record_placement(slot, bid)
+            placements.append(rec)
+            arm.run(arm.home_gen())
+
+    # 7. Summary & Metrics Reports
+    print("\n" + "=" * 60)
+    print("ASSEMBLY SUMMARY & METRICS")
+    print("=" * 60)
+    metrics.print_summary(placements)
+    metrics.save_reports(placements, [], cfg.results_dir, tag="demo3")
+    print(f"[Outputs] Visual detection snapshot saved to: {debug_img_path}")
+    print(f"[Outputs] Placement metrics report saved to: {cfg.results_dir}/")
+
+    # 8. Interactive loop until user closes window
+    _wait_for_user_exit(args.nogui, cfg)
+
+
+def _wait_for_user_exit(nogui: bool, cfg: Config):
+    """Gracefully waits for the user to close the PyBullet window without throwing errors."""
+    if not nogui:
+        print("\nSimulation complete! Close the PyBullet window to exit.")
+        try:
+            while p.isConnected():
+                p.stepSimulation()
+                time.sleep(1.0 / cfg.sim_hz)
+        except (KeyboardInterrupt, p.error):
+            pass
+
+    if p.isConnected():
+        try:
+            p.disconnect()
+        except p.error:
+            pass
+
+
+if __name__ == "__main__":
+    main()

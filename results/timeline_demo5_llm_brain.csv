@@ -1,0 +1,11 @@
+task,kind,robot,brick,row,col,start_s,end_s,status
+mortar_r0c0,MORTAR,mortar,r0c0,0,0,0.0,9.208,done
+mortar_r0c1,MORTAR,mortar,r0c1,0,1,9.213,17.113,done
+transport_r0c0,TRANSPORT,shuttle,r0c0,0,0,0.0,19.2,done
+mortar_r0c2,MORTAR,mortar,r0c2,0,2,17.117,23.75,done
+place_r0c0,PLACE,arm,r0c0,0,0,19.204,40.454,done
+transport_r0c1,TRANSPORT,shuttle,r0c1,0,1,40.458,59.658,done
+place_r0c1,PLACE,arm,r0c1,0,1,59.663,60.833,failed
+place_r0c1,PLACE,arm,r0c1,0,1,60.837,60.837,failed
+place_r0c1,PLACE,arm,r0c1,0,1,60.842,60.842,failed
+transport_r0c2,TRANSPORT,shuttle,r0c2,0,2,60.846,60.846,failed
