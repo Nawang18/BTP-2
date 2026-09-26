@@ -75,6 +75,7 @@ def main():
 
     # Step simulation a few times to let the world settle before taking picture
     for _ in range(5):
+        
         p.stepSimulation()
 
     # 3. Computer Vision: Overhead Camera takes picture and analyzes pixels with OpenCV
