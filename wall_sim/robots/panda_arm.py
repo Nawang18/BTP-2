@@ -9,6 +9,7 @@ all robots move concurrently without threads.
 import math
 
 import numpy as np
+# pyrefly: ignore [missing-import]
 import pybullet as p
 import pybullet_data
 
@@ -121,11 +122,12 @@ class PandaArm:
         self.cfg = cfg
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         self.body = p.loadURDF("franka_panda/panda.urdf",
-                               basePosition=base_position, useFixedBase=True)
+                               basePosition=base_position, useFixedBase=True,
+                               flags=p.URDF_USE_SELF_COLLISION | p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
         self._map_joints()
         for fj in self.finger_joints:
             p.changeDynamics(self.body, fj, jointLowerLimit=0.0, jointUpperLimit=0.05,
-                             lateralFriction=1.2, spinningFriction=0.5)
+                             lateralFriction=1.8, spinningFriction=0.6)
         self.held = None
         self.grasp_offset = np.zeros(3)   # brick pos error measured after grasp
         self.grasp_yaw_err = 0.0          # brick yaw error after grasp
@@ -152,7 +154,7 @@ class PandaArm:
         # use nullspace-biased IK -- pybullet's nullspace gain trades primary
         # task accuracy away (~2 mm steady-state error on the ee pose).
         # Seeding + per-step re-solve keeps the redundant posture continuous.
-        self.rest_config = [0.0, -0.35, 0.0, -1.40, 0.0, 1.30, 0.79]
+        self.rest_config = [0.0, -np.pi/4, 0.0, -3*np.pi/4, 0.0, np.pi/2, np.pi/4]
         for j, q in zip(self.arm_joints, self.rest_config):
             p.resetJointState(self.body, j, q)
         for j in self.finger_joints:
@@ -172,6 +174,7 @@ class PandaArm:
         sol = p.calculateInverseKinematics(
             self.body, self.ee_link, pos, orn,
             maxNumIterations=200, residualThreshold=1e-8)
+        
         # solution covers all movable joints (7 arm + 2 fingers) in order
         if len(sol) == len(self.movable):
             return dict(zip(self.movable, sol))
@@ -294,7 +297,7 @@ class PandaArm:
         yield from self.move_gen((x, y, z), orn)
 
     # -- behaviours ----------------------------------------------------------
-    def pick_gen(self, brick_id, brick_center, yaw=0.0, orn=None, normal=None):
+    def pick_gen(self, brick_id, brick_center, yaw=0.0, orn=None, normal=None, is_tilted=False):
         cfg = self.cfg
         cx, cy, cz = brick_center
         if orn is None:
@@ -307,14 +310,25 @@ class PandaArm:
                 n /= n_len
             if n[2] < 0:
                 n = -n
-            hand_above = tuple(np.array(brick_center) + n * (cfg.grip_depth + cfg.approach_height))
+            # Extra clearance for tilted bricks to avoid clipping the raised edge
+            approach_clearance = cfg.approach_height * 1.3 if is_tilted else cfg.approach_height
+            hand_above = tuple(np.array(brick_center) + n * (cfg.grip_depth + approach_clearance))
             hand_grasp = tuple(np.array(brick_center) + n * cfg.grip_depth)
         else:
             hand_above = (cx, cy, cz + cfg.grip_depth + cfg.approach_height)
             hand_grasp = (cx, cy, cz + cfg.grip_depth)
 
+        # For tilted bricks: open fingers wider to increase capture envelope
+        if is_tilted:
+            yield from self.gripper_gen(min(0.05, cfg.gripper_open + 0.005))
+
         yield from self.transit_gen(hand_above[0], hand_above[1], hand_above[2], orn=orn)
-        yield from self.move_gen(hand_grasp, orn, speed=cfg.arm_speed / 2.0)
+        approach_speed = cfg.arm_speed / 3.0 if is_tilted else cfg.arm_speed / 2.0
+        yield from self.move_gen(hand_grasp, orn, speed=approach_speed)
+
+        # For tilted bricks: gradual two-stage close to avoid knocking brick off support
+        if is_tilted:
+            yield from self.gripper_gen(0.015, hold_s=0.2)
         yield from self.gripper_gen(0.0, hold_s=cfg.gripper_hold_s)
 
         pre_z = p.getBasePositionAndOrientation(brick_id)[0][2]
@@ -345,18 +359,65 @@ class PandaArm:
 
     def place_gen(self, target_center, yaw=0.0):
         cfg = self.cfg
-        # subtract the measured grasp offset: command the hand so the BRICK
-        # (not the hand) lands on target
+        # Phase 1: Use stale grasp offset for the transit approach (close enough
+        # for clearance). The brick may shift during the long arm swing, so the
+        # stale offset only gets us to the right neighbourhood.
         tgt = (np.asarray(target_center, dtype=float) - self.grasp_offset)
         cx, cy, cz = tgt
         orn = gripper_down_quaternion(yaw - self.grasp_yaw_err)
-        hand_above = (cx, cy, cz + cfg.grip_depth + cfg.approach_height)
-        hand_place = (cx, cy, cz + cfg.grip_depth)
+        above_z = cz + cfg.grip_depth + cfg.approach_height
 
-        yield from self.transit_gen(cx, cy, hand_above[2], yaw=yaw - self.grasp_yaw_err)
-        yield from self.move_gen(hand_place, orn, speed=cfg.arm_speed / 2.0)
+        yield from self.transit_gen(cx, cy, above_z, yaw=yaw - self.grasp_yaw_err)
+
+        # Phase 2: Live position re-calibration — measure the actual EE-to-brick
+        # vector NOW (after transit), so the final descent is precise regardless
+        # of any in-grip shift that happened during the swing.
+        # NOTE: Yaw is NOT re-calibrated here. Friction prevents yaw slip in
+        # the gripper, so the stale grasp_yaw_err remains accurate. Changing
+        # the yaw during descent would cause the brick to orbit around the EE.
+        if self.held is not None:
+            # Phase 2a: Fresh yaw correction at transit height.
+            # The brick may have rotated in the gripper during the long swing.
+            # Measure the brick's ACTUAL yaw and rotate the EE to bring it to
+            # the target yaw. This rotation happens at transit height (safe —
+            # nothing to collide with) BEFORE measuring the position offset.
+            brick_pos, brick_orn_q = p.getBasePositionAndOrientation(self.held)
+            brick_yaw_now = p.getEulerFromQuaternion(brick_orn_q)[2]
+            
+            # Grip constant k: brick_yaw = ee_commanded_yaw + k (fixed by grip)
+            grip_k = brick_yaw_now - (yaw - self.grasp_yaw_err)
+            
+            # Normalize grip_k to [-pi/2, pi/2] because a brick is symmetric.
+            # This prevents the arm from doing a 180-degree spin if the yaw
+            # flipped between symmetrically equivalent orientations.
+            grip_k = (grip_k + np.pi/2) % np.pi - np.pi/2
+            
+            corrected_ee_yaw = yaw - grip_k
+            orn = gripper_down_quaternion(corrected_ee_yaw)
+
+            # Rotate in-place at transit height (brick orbits at safe altitude)
+            if abs(grip_k) > math.radians(0.5):
+                ee_pos, _ = self.ee_pose()
+                yield from self.move_gen(tuple(ee_pos), orn, speed=cfg.arm_speed / 2.0)
+
+            # Phase 2b: Live position re-calibration AFTER yaw correction.
+            # Measure the actual EE-to-brick vector so the final descent is
+            # purely translational with no orbit effect.
+            brick_pos, _ = p.getBasePositionAndOrientation(self.held)
+            ee_pos, _ = self.ee_pose()
+            ee_to_brick = np.array(brick_pos) - np.array(ee_pos)
+            
+            # To land the brick at target_center, command EE to:
+            hand_place = tuple(np.array(target_center) - ee_to_brick)
+            yaw_fix_deg = math.degrees(grip_k)
+            print(f"[place] live recal: yaw fix {yaw_fix_deg:+.1f}\u00b0 | "
+                  f"ee_to_brick {np.round(ee_to_brick * 1000, 1)} mm")
+        else:
+            hand_place = (cx, cy, cz + cfg.grip_depth)
+
+        yield from self.move_gen(hand_place, orn, speed=cfg.arm_speed / 3.0)
         yield from self.gripper_gen(cfg.gripper_open, hold_s=0.5)
-        yield from self.wait_gen(0.2)   # let the brick settle before verifying
+        yield from self.wait_gen(0.3)   # let the brick settle before verifying
 
         # Closed-loop release verification: check if brick actually detached from gripper
         placed_brick = self.held

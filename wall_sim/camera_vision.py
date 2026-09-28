@@ -18,6 +18,60 @@ import pybullet as p
 from .config import Config
 
 
+def _ransac_plane_fit(pts_3d, n_iter=100, threshold=0.004):
+    """RANSAC plane fitting on a 3D point cloud.
+
+    Fits a plane to the point cloud and returns the surface normal and
+    the fraction of inlier points.  Much more robust than raw PCA for
+    noisy depth data and partial occlusion from support wedges.
+
+    Returns:
+        normal (np.ndarray): unit normal of the best-fit plane (z > 0).
+        inlier_ratio (float): fraction of points within *threshold* of the plane.
+    """
+    best_normal = np.array([0.0, 0.0, 1.0])
+    best_inlier_count = 0
+    best_inlier_mask = None
+    n = len(pts_3d)
+    if n < 3:
+        return best_normal, 0.0
+
+    for _ in range(n_iter):
+        idx = np.random.choice(n, 3, replace=False)
+        p0, p1, p2 = pts_3d[idx]
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-10:
+            continue
+        normal /= norm_len
+        if normal[2] < 0:
+            normal = -normal
+
+        distances = np.abs((pts_3d - p0) @ normal)
+        mask = distances < threshold
+        count = int(np.sum(mask))
+        if count > best_inlier_count:
+            best_inlier_count = count
+            best_normal = normal.copy()
+            best_inlier_mask = mask
+
+    # Refine: least-squares PCA on inliers only for a smoother normal
+    if best_inlier_mask is not None and int(np.sum(best_inlier_mask)) >= 10:
+        inlier_pts = pts_3d[best_inlier_mask]
+        c_mean = np.mean(inlier_pts, axis=0)
+        cov = np.cov(inlier_pts - c_mean, rowvar=False)
+        _, evecs = np.linalg.eigh(cov)
+        refined = evecs[:, 0]   # smallest eigenvalue = normal direction
+        if refined[2] < 0:
+            refined = -refined
+        best_normal = refined
+
+    inlier_ratio = best_inlier_count / n if n > 0 else 0.0
+    return best_normal, inlier_ratio
+
+
 class OverheadCamera:
     """Simulated RGB-D Overhead Camera with OpenCV vision processing."""
 
@@ -185,6 +239,7 @@ class OverheadCamera:
 
             normal = np.array([0.0, 0.0, 1.0])
             tilt_deg = 0.0
+            tilt_confidence = 0.0
             gripper_quat = None
 
             if len(vs) >= 20:
@@ -197,13 +252,42 @@ class OverheadCamera:
                 pts_z = self.eye_pos[2] - z_pts
                 pts_3d = np.column_stack([pts_x, pts_y, pts_z])
 
+                # RANSAC plane fit for robust surface normal (filters depth
+                # noise and support-wedge outlier pixels)
+                ransac_normal, inlier_ratio = _ransac_plane_fit(
+                    pts_3d, n_iter=100, threshold=0.004
+                )
+                tilt_confidence = inlier_ratio
+
+                # PCA for axis decomposition (eigenvec ordering: smallest → largest)
                 c_mean = np.mean(pts_3d, axis=0)
                 cov = np.cov(pts_3d - c_mean, rowvar=False)
                 eigenvals, eigenvecs = np.linalg.eigh(cov)
-                est_norm = eigenvecs[:, 0]
-                if est_norm[2] < 0:
-                    est_norm = -est_norm
-                normal = est_norm
+
+                # Use RANSAC normal when inlier ratio is good; else PCA fallback
+                if inlier_ratio >= 0.55:
+                    normal = ransac_normal
+                else:
+                    est_norm = eigenvecs[:, 0]
+                    if est_norm[2] < 0:
+                        est_norm = -est_norm
+                    normal = est_norm
+
+                # Extract yaw from 3D PCA major axis projected onto the ground
+                # plane — immune to perspective distortion on tilted bricks.
+                # Only override the 2D yaw for tilted bricks (>5°); for flat
+                # bricks the 2D minAreaRect yaw is already accurate and
+                # the 3D override can regress those cases.
+                tilt_check_rad = math.acos(float(np.clip(normal[2], -1.0, 1.0)))
+                tilt_check_deg = math.degrees(tilt_check_rad)
+                if tilt_check_deg > 5.0 and len(pts_3d) >= 50:
+                    major_axis_3d = eigenvecs[:, 2]
+                    major_xy = major_axis_3d[:2].copy()
+                    if np.linalg.norm(major_xy) > 1e-6:
+                        major_xy /= np.linalg.norm(major_xy)
+                        pca_yaw = float(math.atan2(major_xy[1], major_xy[0]))
+                        pca_yaw = (pca_yaw + math.pi / 2.0) % math.pi - math.pi / 2.0
+                        world_yaw = pca_yaw
 
                 l_axis = eigenvecs[:, 2]
                 l_axis = l_axis - np.dot(l_axis, normal) * normal
@@ -235,6 +319,7 @@ class OverheadCamera:
                 "pixel_center": (center_u, center_v),
                 "depth_meters": z_dist,
                 "contour_area": area,
+                "tilt_confidence": float(tilt_confidence),
             })
 
             if vis_bgr is not None:
