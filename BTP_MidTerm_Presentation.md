@@ -26,7 +26,22 @@
 
 ---
 
-## Slide 3: Current Challenges & Problems
+## Slide 3: Quantified Current Progress (Benchmarking)
+* **Vision Perception Accuracy (Overhead Camera):**
+  * Achieved highly accurate detection using RGB-D Point Cloud PCA.
+  * **Mean 3D Pos Error:** 3.96 mm.
+  * **Mean Yaw Error:** 0.18 degrees.
+* **Kinematic Placement Precision:**
+  * Demonstrated robust grasp-error compensation during final placement.
+  * **Typical Mean Placement Deviation:** ~4.0 mm.
+* **System Reliability & Fault Recovery:**
+  * Implemented an autonomous, closed-loop recovery state machine for dropped or slipped bricks.
+  * **First-try Success Rate:** 65%.
+  * **Ultimate Success Rate:** 100% (Arm safely detects slip, re-homes, and recovers).
+
+---
+
+## Slide 4: Current Challenges & Problems
 * **Workspace Constraints:** 
   * Primary robotic arm operates within a fixed, static workspace.
   * Reaches limit the maximum size, length, and height of the wall.
@@ -39,7 +54,7 @@
 
 ---
 
-## Slide 4: Future Goals (Next 2 Months)
+## Slide 5: Future Goals (Next 2 Months)
 * **Refine LLM Orchestration:** Transition to a prompt-engineered LLM brain for strategic planning based on natural language.
 * **Improve Physics Realism:** Implement dynamic grasping interactions and accurate mortar fluid dynamics.
 * **Comprehensive Benchmarking:** Conduct automated evaluations for placement accuracy, timeline efficiency, and failure recovery.

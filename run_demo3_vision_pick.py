@@ -470,11 +470,10 @@ def main():
             print(f"  [Pick] Attempt {pick_attempt}/{MAX_PICK_RETRIES} for {brick['label']} "
                   f"(Target Yaw={vpose['yaw_deg']:.1f}°{tilt_str})...")
 
-            # Use physics ground-truth position for reliable pick (like demo 5
-            # picks from a known pedestal). Vision yaw is still used for
-            # gripper orientation.
+            # Fully autonomous pick using purely the computer vision pose estimation.
+            # (No cheating with physics ground-truth for position or orientation!)
             cur_brick_pos, cur_brick_orn = p.getBasePositionAndOrientation(bid)
-            pick_target = (cur_brick_pos[0], cur_brick_pos[1], cur_brick_pos[2])
+            pick_target = (vpose["x"], vpose["y"], vpose["z"])
 
             # --- DIAGNOSTIC: Pre-pick parameters ---
             xy_gap = math.hypot(vpose["x"] - cur_brick_pos[0], vpose["y"] - cur_brick_pos[1])

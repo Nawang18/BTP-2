@@ -33,7 +33,35 @@ img_path_scene = r"C:\Users\Nawang Tashi\.gemini\antigravity-ide\brain\cbbac865-
 if os.path.exists(img_path_scene):
     slide2.shapes.add_picture(img_path_scene, Inches(5.5), Inches(2), width=Inches(4))
 
-# Slide 3: Current Challenges & Problems
+# Slide 3: Quantified Current Progress (Benchmarking)
+slide_new = prs.slides.add_slide(bullet_slide_layout)
+shapes_new = slide_new.shapes
+title_shape_new = shapes_new.title
+body_shape_new = shapes_new.placeholders[1]
+title_shape_new.text = "Quantified Current Progress (Benchmarking)"
+tf_new = body_shape_new.text_frame
+tf_new.text = "Vision Perception Accuracy (Overhead Camera):"
+p_new = tf_new.add_paragraph()
+p_new.text = "Mean 3D Pos Error: 3.96 mm  |  Mean Yaw Error: 0.18 degrees"
+p_new.level = 1
+p_new = tf_new.add_paragraph()
+p_new.text = "Kinematic Placement Precision:"
+p_new = tf_new.add_paragraph()
+p_new.text = "Demonstrated robust grasp-error compensation during final placement."
+p_new.level = 1
+p_new = tf_new.add_paragraph()
+p_new.text = "Typical Mean Placement Deviation: ~4.0 mm"
+p_new.level = 1
+p_new = tf_new.add_paragraph()
+p_new.text = "System Reliability & Fault Recovery:"
+p_new = tf_new.add_paragraph()
+p_new.text = "First-try Pick Success Rate: 65%"
+p_new.level = 1
+p_new = tf_new.add_paragraph()
+p_new.text = "Ultimate Success Rate: 100% (Arm safely detects slip and recovers)"
+p_new.level = 1
+
+# Slide 4: Current Challenges & Problems
 slide3 = prs.slides.add_slide(bullet_slide_layout)
 shapes3 = slide3.shapes
 title_shape3 = shapes3.title

@@ -117,55 +117,52 @@ def gripper_3d_orientation(normal, length_axis):
     return mat2quat(R)
 
 
-class PandaArm:
+class KukaArm:
     def __init__(self, cfg: Config, base_position=(0.0, 0.0, 0.0)):
         self.cfg = cfg
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        self.body = p.loadURDF("franka_panda/panda.urdf",
-                               basePosition=base_position, useFixedBase=True,
-                               flags=p.URDF_USE_SELF_COLLISION | p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT)
+        
+        # Kuka is typically loaded from SDF with a gripper
+        self.body = p.loadSDF("kuka_iiwa/kuka_with_gripper2.sdf")[0]
+        p.resetBasePositionAndOrientation(self.body, base_position, [0, 0, 0, 1])
+        
         self._map_joints()
+        
+        # Increase friction for the Robotiq-style gripper fingers
         for fj in self.finger_joints:
-            p.changeDynamics(self.body, fj, jointLowerLimit=0.0, jointUpperLimit=0.05,
-                             lateralFriction=1.8, spinningFriction=0.6)
+            p.changeDynamics(self.body, fj, lateralFriction=2.0, spinningFriction=1.0)
+            
         self.held = None
-        self.grasp_offset = np.zeros(3)   # brick pos error measured after grasp
-        self.grasp_yaw_err = 0.0          # brick yaw error after grasp
+        self.grasp_offset = np.zeros(3)
+        self.grasp_yaw_err = 0.0
+        
+        # Override config for Robotiq gripper (0.0 is open, 0.5 is closed)
+        self.cfg.gripper_open = 0.0
+        self.cfg.gripper_closed = 0.5
+        
+        # FIX: The Robotiq gripper is ~21cm long! (Panda was 8.5cm)
+        # We must override the grip depth so the KUKA doesn't smash into the floor.
+        self.cfg.grip_depth = 0.23
+        self.cfg.transit_z = 0.50
 
     # -- setup ---------------------------------------------------------------
     def _map_joints(self):
-        self.arm_joints, self.finger_joints, self.movable = [], [], []
-        self.ee_link = None
-        self.ll, self.ul, self.jr = [], [], []
-        n = p.getNumJoints(self.body)
-        for i in range(n):
-            info = p.getJointInfo(self.body, i)
-            jtype = info[2]
-            if jtype == p.JOINT_REVOLUTE:
-                self.arm_joints.append(i)
-                self.movable.append(i)
-                self.ll.append(info[8])
-                self.ul.append(info[9])
-                self.jr.append(info[9] - info[8])
-            elif jtype == p.JOINT_PRISMATIC:
-                self.finger_joints.append(i)
-                self.movable.append(i)
-                self.ll.append(info[8])
-                self.ul.append(info[9])
-                self.jr.append(info[9] - info[8])
-            if info[12].decode() == "panda_hand":
-                self.ee_link = i
-        assert self.ee_link is not None, "panda_hand link not found"
-
-        # Define the rest poses for all movable joints.
-        # This keeps the elbow up and prevents the IK solver from crossing singularities.
-        self.rest_config = [0.0, -np.pi/4, 0.0, -3*np.pi/4, 0.0, np.pi/2, np.pi/4]
-        self.rp = self.rest_config + [self.cfg.gripper_open, self.cfg.gripper_open]
+        self.arm_joints = [0, 1, 2, 3, 4, 5, 6]
+        # The Robotiq gripper on the Kuka SDF uses revolute joints to close
+        self.finger_joints = [8, 10, 11, 13]
+        self.movable = self.arm_joints + self.finger_joints
         
+        # Use link 7 (the base of the gripper) as the EE for IK calculation
+        self.ee_link = 7
+        
+        # Kuka rest pose (straight up with slight bend)
+        self.rest_config = [0.0, -np.pi/4, 0.0, np.pi/2, 0.0, np.pi/4, 0.0]
         for j, q in zip(self.arm_joints, self.rest_config):
             p.resetJointState(self.body, j, q)
+            
+        # Open gripper by default
         for j in self.finger_joints:
-            p.resetJointState(self.body, j, self.cfg.gripper_open)
+            p.resetJointState(self.body, j, 0.0)
 
     # -- state ---------------------------------------------------------------
     def ee_pose(self):
@@ -178,23 +175,14 @@ class PandaArm:
 
     # -- IK / commands -------------------------------------------------------
     def solve_ik(self, pos, orn):
-        # We now pass lowerLimits, upperLimits, jointRanges, and restPoses.
-        # This constrains the IK solver's null space, preventing erratic 
-        # singularity jumps (like the elbow flipping or wrist spinning).
         sol = p.calculateInverseKinematics(
             self.body, self.ee_link, pos, orn,
-            lowerLimits=self.ll,
-            upperLimits=self.ul,
-            jointRanges=self.jr,
-            restPoses=self.rp,
             maxNumIterations=200, residualThreshold=1e-8)
         
-        # solution covers all movable joints (7 arm + 2 fingers) in order
-        if len(sol) == len(self.movable):
-            return dict(zip(self.movable, sol))
-        if len(sol) == len(self.arm_joints):
-            return dict(zip(self.arm_joints, sol))
-        raise RuntimeError(f"unexpected IK solution length {len(sol)}")
+        # PyBullet returns an IK solution for all movable joints (12 for this SDF).
+        # We only care about controlling the 7 arm joints (indices 0-6).
+        # The gripper joints are controlled explicitly in _command_gripper.
+        return dict(zip(self.arm_joints, sol[:7]))
 
     def check_reachability(self, target_pos, yaw=0.0, orn=None, normal=None):
         """Tests whether a 3D target position can be reached with the arm.
@@ -254,10 +242,12 @@ class PandaArm:
                 maxVelocity=self.cfg.arm_max_joint_vel)
 
     def _command_gripper(self, target):
-        for j in self.finger_joints:
-            p.setJointMotorControl2(
-                self.body, j, p.POSITION_CONTROL,
-                targetPosition=target, force=self.cfg.gripper_force)
+        # target is an angle for the Robotiq gripper. 
+        # Typically 0 is fully open, 0.5 is closed.
+        p.setJointMotorControl2(self.body, 8, p.POSITION_CONTROL, targetPosition=target, force=self.cfg.gripper_force)
+        p.setJointMotorControl2(self.body, 11, p.POSITION_CONTROL, targetPosition=target, force=self.cfg.gripper_force)
+        p.setJointMotorControl2(self.body, 10, p.POSITION_CONTROL, targetPosition=-target, force=self.cfg.gripper_force)
+        p.setJointMotorControl2(self.body, 13, p.POSITION_CONTROL, targetPosition=-target, force=self.cfg.gripper_force)
 
     # -- motion primitives (generators: one yield == one sim step) -----------
     def move_gen(self, pos, orn, speed=None, tol=0.0005, hold_timeout_s=2.0):
@@ -334,7 +324,7 @@ class PandaArm:
 
         # For tilted bricks: open fingers wider to increase capture envelope
         if is_tilted:
-            yield from self.gripper_gen(min(0.05, cfg.gripper_open + 0.005))
+            yield from self.gripper_gen(cfg.gripper_open)
 
         yield from self.transit_gen(hand_above[0], hand_above[1], hand_above[2], orn=orn)
         approach_speed = cfg.arm_speed / 3.0 if is_tilted else cfg.arm_speed / 2.0
@@ -342,8 +332,8 @@ class PandaArm:
 
         # For tilted bricks: gradual two-stage close to avoid knocking brick off support
         if is_tilted:
-            yield from self.gripper_gen(0.015, hold_s=0.2)
-        yield from self.gripper_gen(0.0, hold_s=cfg.gripper_hold_s)
+            yield from self.gripper_gen(cfg.gripper_closed * 0.5, hold_s=0.2)
+        yield from self.gripper_gen(cfg.gripper_closed, hold_s=cfg.gripper_hold_s)
 
         pre_z = p.getBasePositionAndOrientation(brick_id)[0][2]
         yield from self.move_gen((hand_grasp[0], hand_grasp[1],
@@ -458,7 +448,7 @@ class PandaArm:
         print("[Recovery] Executing dislodge maneuver (descend, cycle fingers, wiggle)...")
         yield from self.move_gen(hand_place, orn, speed=cfg.arm_speed / 2.0)
         # Cycle fingers: partially close and reopen fully to break friction stiction
-        yield from self.gripper_gen(0.025, hold_s=0.2)
+        yield from self.gripper_gen(cfg.gripper_closed * 0.5, hold_s=0.2)
         yield from self.gripper_gen(cfg.gripper_open, hold_s=0.4)
 
         # Micro-wiggle in yaw to free pinched corners

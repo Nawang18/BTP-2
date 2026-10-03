@@ -50,7 +50,7 @@ from wall_sim.scene import (
     build_world, make_brick, make_tilted_brick, draw_slot_outline
 )
 from wall_sim.wall_plan import plan_wall
-from wall_sim.robots.panda_arm import (
+from wall_sim.robots.panda_arm_debug import (
     PandaArm, GripFailed, PlaceFailed, gripper_3d_orientation, gripper_down_quaternion
 )
 from wall_sim.camera_vision import OverheadCamera
@@ -146,7 +146,7 @@ def generate_random_coords(count: int, cfg: Config, include_unreachable: bool = 
     # Minimum centre-to-centre distance: half the brick diagonal for each
     # brick (≈ 107 mm each → 214 mm total) plus a small clearance so the
     # gripper fingers can close without hitting a neighbour.
-    min_sep = math.hypot(b.length, b.width) + 0.03   # ~240 mm
+    min_sep = math.hypot(b.length, b.width) / 2.0 + 0.03   # ~140 mm
     max_retries = 500
 
     for k in range(count):

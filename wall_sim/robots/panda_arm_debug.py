@@ -136,7 +136,6 @@ class PandaArm:
     def _map_joints(self):
         self.arm_joints, self.finger_joints, self.movable = [], [], []
         self.ee_link = None
-        self.ll, self.ul, self.jr = [], [], []
         n = p.getNumJoints(self.body)
         for i in range(n):
             info = p.getJointInfo(self.body, i)
@@ -144,24 +143,18 @@ class PandaArm:
             if jtype == p.JOINT_REVOLUTE:
                 self.arm_joints.append(i)
                 self.movable.append(i)
-                self.ll.append(info[8])
-                self.ul.append(info[9])
-                self.jr.append(info[9] - info[8])
             elif jtype == p.JOINT_PRISMATIC:
                 self.finger_joints.append(i)
                 self.movable.append(i)
-                self.ll.append(info[8])
-                self.ul.append(info[9])
-                self.jr.append(info[9] - info[8])
             if info[12].decode() == "panda_hand":
                 self.ee_link = i
         assert self.ee_link is not None, "panda_hand link not found"
 
-        # Define the rest poses for all movable joints.
-        # This keeps the elbow up and prevents the IK solver from crossing singularities.
+        # Seed at a comfortable elbow-up config. NOTE: we deliberately do NOT
+        # use nullspace-biased IK -- pybullet's nullspace gain trades primary
+        # task accuracy away (~2 mm steady-state error on the ee pose).
+        # Seeding + per-step re-solve keeps the redundant posture continuous.
         self.rest_config = [0.0, -np.pi/4, 0.0, -3*np.pi/4, 0.0, np.pi/2, np.pi/4]
-        self.rp = self.rest_config + [self.cfg.gripper_open, self.cfg.gripper_open]
-        
         for j, q in zip(self.arm_joints, self.rest_config):
             p.resetJointState(self.body, j, q)
         for j in self.finger_joints:
@@ -178,15 +171,8 @@ class PandaArm:
 
     # -- IK / commands -------------------------------------------------------
     def solve_ik(self, pos, orn):
-        # We now pass lowerLimits, upperLimits, jointRanges, and restPoses.
-        # This constrains the IK solver's null space, preventing erratic 
-        # singularity jumps (like the elbow flipping or wrist spinning).
         sol = p.calculateInverseKinematics(
             self.body, self.ee_link, pos, orn,
-            lowerLimits=self.ll,
-            upperLimits=self.ul,
-            jointRanges=self.jr,
-            restPoses=self.rp,
             maxNumIterations=200, residualThreshold=1e-8)
         
         # solution covers all movable joints (7 arm + 2 fingers) in order
@@ -247,6 +233,23 @@ class PandaArm:
 
     def _command_arm(self, ee_pos, ee_orn):
         targets = self.solve_ik(ee_pos, ee_orn)
+        
+        # --- DEBUG: Catch IK Singularity Jumps ---
+        current_q = [p.getJointState(self.body, j)[0] for j in self.arm_joints]
+        max_jump = 0.0
+        jump_j = -1
+        for idx, j in enumerate(self.arm_joints):
+            diff = abs(targets[j] - current_q[idx])
+            if diff > max_jump:
+                max_jump = diff
+                jump_j = j
+                
+        # 0.5 radians (28.6 degrees) is a huge jump for a single simulation frame
+        if max_jump > 0.5:
+            print(f"\n[IK WARNING] Singularity crossed or IK flip detected!")
+            print(f"             Joint {jump_j} jumped by {math.degrees(max_jump):.1f} degrees instantly.")
+        # -----------------------------------------
+
         for j in self.arm_joints:
             p.setJointMotorControl2(
                 self.body, j, p.POSITION_CONTROL,
