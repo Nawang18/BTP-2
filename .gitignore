@@ -82,3 +82,10 @@ desktop.ini
 # PyBullet logs / physics recordings
 *.bullet
 *.bullet_log
+
+# Personal files (viva prep, private notes)
+README_PERSONAL.md
+README_PERSONAL*
+*personal*
+*private*
+

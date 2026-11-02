@@ -41,16 +41,17 @@ def make_brick(cfg: Config, center, yaw=0.0, length=None, roll=0.0, pitch=0.0, o
     return bid
 
 
-def make_tilted_brick(cfg: Config, center, roll=0.0, pitch=0.0, yaw=0.0, with_support=True):
+def make_tilted_brick(cfg: Config, center, roll=0.0, pitch=0.0, yaw=0.0, length=None, with_support=True):
     """Spawns a brick tilted relative to the ground plane, with an optional static wedge
     underneath so it physically stays at the inclined angle."""
-    bid = make_brick(cfg, center, yaw=yaw, roll=roll, pitch=pitch)
+    bid = make_brick(cfg, center, yaw=yaw, roll=roll, pitch=pitch, length=length)
     if with_support and (abs(roll) > 0.01 or abs(pitch) > 0.01):
         # Spawn a small support wedge under the raised edge
         import numpy as np
+        b_len = length if length is not None else cfg.brick.length
         rot_mat = np.array(p.getMatrixFromQuaternion(p.getQuaternionFromEuler((roll, pitch, yaw)))).reshape((3, 3))
-        # Place support block slightly behind center
-        support_offset = rot_mat @ np.array([-0.06, 0.0, -cfg.brick.height / 2.0])
+        # Place support block slightly behind center scaled to brick length
+        support_offset = rot_mat @ np.array([-0.3 * (b_len / cfg.brick.length) * 0.20, 0.0, -cfg.brick.height / 2.0])
         prop_pos = (center[0] + support_offset[0], center[1] + support_offset[1], 0.015)
         make_static_box(prop_pos, (0.04, 0.06, 0.03), (0.4, 0.4, 0.4, 0.8))
     return bid

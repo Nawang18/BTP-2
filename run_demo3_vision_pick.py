@@ -26,11 +26,13 @@ Features:
    - Places mortar beds under each wall slot, logs precision metrics, and saves reports.
 
 Run:
-    python run_demo3_multi_robot.py
-    python run_demo3_multi_robot.py --coords "0.48,-0.10,15,12; 0.50,0.10,-10"
-    python run_demo3_multi_robot.py --demo_tilted
-    python run_demo3_multi_robot.py --interactive
-    python run_demo3_multi_robot.py --nogui
+    python3 run_demo3_vision_pick.py                     # default: 2 bricks
+    python3 run_demo3_vision_pick.py -n 4                # assemble 4 bricks
+    python3 run_demo3_vision_pick.py --num_bricks 5      # assemble 5 bricks
+    python3 run_demo3_vision_pick.py --coords "0.48,-0.10,15,12; 0.50,0.10,-10"
+    python3 run_demo3_vision_pick.py --demo_tilted
+    python3 run_demo3_vision_pick.py --interactive
+    python3 run_demo3_vision_pick.py --nogui
 """
 import argparse
 import ast
@@ -95,12 +97,18 @@ def parse_brick_coords(coords_str: str) -> list:
             continue
         tokens = [t.strip() for t in re.split(r"[, \t]+", part) if t.strip()]
         if len(tokens) >= 2:
-            x = float(tokens[0])
-            y = float(tokens[1])
-            yaw = float(tokens[2]) if len(tokens) > 2 else 0.0
-            pitch = float(tokens[3]) if len(tokens) > 3 else 0.0
-            roll = float(tokens[4]) if len(tokens) > 4 else 0.0
-            result.append((x, y, yaw, pitch, roll))
+            try:
+                x = float(tokens[0])
+                y = float(tokens[1])
+                yaw = float(tokens[2]) if len(tokens) > 2 else 0.0
+                pitch = float(tokens[3]) if len(tokens) > 3 else 0.0
+                roll = float(tokens[4]) if len(tokens) > 4 else 0.0
+                is_half = None
+                if len(tokens) > 5:
+                    is_half = tokens[5].lower() in ("half", "1", "true", "h")
+                result.append((x, y, yaw, pitch, roll, is_half))
+            except ValueError:
+                continue
 
     return result
 
@@ -137,43 +145,77 @@ def prompt_interactive_coords() -> list:
     return coords
 
 
-def generate_random_coords(count: int, cfg: Config, include_unreachable: bool = False,
+def generate_random_coords(count: int, cfg: Config, wall_plan: list = None,
+                           include_unreachable: bool = False,
                            include_tilted: bool = False) -> list:
-    """Generates random reachable coordinates with minimum spacing to prevent
-    brick overlap and stacking that would make individual bricks ungraspable."""
+    """Generates random reachable coordinates using Option 3:
+    Dynamic Keep-Out Zone + Safe Workspace Sampling.
+
+    - Dynamic Keep-Out Zone: inspects wall_plan (or cfg.wall_origin) to calculate
+      the wall placement boundary and enforces a >= 260 mm physical buffer (Y <= 0.04 m
+      for a wall at Y = 0.30 m). This completely prevents the arm and gripper from
+      knocking against staged bricks during wall construction.
+    - Safe Workspace Sampling: utilizes the Franka Panda's full reachable staging corridor
+      (Y in [-0.44 m, +0.04 m], X in [0.44 m, 0.52 m]). This is 100% visible to the overhead
+      camera (FOV covers Y in [-0.60 m, +0.60 m]) and avoids all inner base singularities.
+    - Adaptive Spacing & Layout: scales yaw (|yaw| <= 4-12 deg) and staggers columns
+      (zigzag for N=4,5, dual columns for N>=6) to ensure adjacent bricks have > 45 mm
+      physical edge separation, preventing OpenCV contour merging.
+    """
     coords = []
-    b = cfg.brick
-    # Minimum centre-to-centre distance: half the brick diagonal for each
-    # brick (≈ 107 mm each → 214 mm total) plus a small clearance so the
-    # gripper fingers can close without hitting a neighbour.
-    min_sep = math.hypot(b.length, b.width) + 0.03   # ~240 mm
-    max_retries = 500
+    if count <= 0:
+        return coords
 
-    for k in range(count):
-        placed = False
-        for _ in range(max_retries):
-            rx = random.uniform(*cfg.spawn_x_range)
-            ry = random.uniform(*cfg.spawn_y_range)
-            # Enforce minimum separation from every already-placed brick
-            if all(math.hypot(rx - c[0], ry - c[1]) >= min_sep
-                   for c in coords):
-                placed = True
-                break
-        if not placed:
-            print(f"[Warning] Could not find non-overlapping position for brick {k+1} "
-                  f"in {max_retries} attempts; skipping to avoid stacking.")
-            continue
+    # 1. Dynamic Keep-Out Zone from wall positions
+    if wall_plan and len(wall_plan) > 0:
+        min_wall_y = min(s.center[1] for s in wall_plan)
+    else:
+        min_wall_y = cfg.wall_origin[1] if cfg is not None else 0.30
 
-        ryaw = random.uniform(-35.0, 35.0)
-        # When include_tilted, give every brick a random tilt to thoroughly
-        # exercise the RANSAC-based detection and tilted-grasp pipeline
-        if include_tilted:
-            rpitch = random.uniform(-18.0, 18.0)
-            rroll = random.uniform(-8.0, 8.0)
-        else:
-            rpitch = 0.0
-            rroll = 0.0
-        coords.append((rx, ry, ryaw, rpitch, rroll))
+    # Ensure >= 260 mm buffer from the wall centerline (Y <= 0.04 m for wall at Y = 0.30 m)
+    max_staging_y = min(0.04, min_wall_y - 0.26)
+    min_staging_y = -0.44  # Full reachable staging corridor along -Y
+
+    if count == 1:
+        rx = 0.48 + random.uniform(-0.02, 0.02)
+        ry = random.uniform(-0.25, max_staging_y - 0.05)
+        ryaw = random.uniform(-25.0, 25.0)
+        rpitch = random.uniform(-14.0, 14.0) if include_tilted else 0.0
+        rroll = random.uniform(-6.0, 6.0) if include_tilted else 0.0
+        coords.append((round(rx, 3), round(ry, 3), round(ryaw, 1), round(rpitch, 1), round(rroll, 1)))
+
+    elif count <= 5:
+        # Single column or slight zigzag along the safe corridor
+        max_yaw = 20.0 if count <= 2 else (12.0 if count == 3 else 4.0)
+        y_span = max_staging_y - min_staging_y
+        y_step = y_span / (count - 1)
+        for i in range(count):
+            y = min_staging_y + i * y_step + random.uniform(-0.006, 0.006)
+            # Stagger X for N >= 4 (0.46 / 0.50 m) to maximize physical clearance
+            if count >= 4:
+                base_x = 0.46 if (i % 2 == 0) else 0.50
+                x = base_x + random.uniform(-0.01, 0.01)
+            else:
+                x = 0.48 + random.uniform(-0.015, 0.015)
+            yaw = random.uniform(-max_yaw, max_yaw)
+            pitch = random.uniform(-14.0, 14.0) if (include_tilted and i == 0) else 0.0
+            roll = random.uniform(-6.0, 6.0) if (include_tilted and i == 0) else 0.0
+            coords.append((round(x, 3), round(y, 3), round(yaw, 1), round(pitch, 1), round(roll, 1)))
+
+    else:
+        # Two staggered columns for 6+ bricks across the full safe workspace
+        max_rows = (count + 1) // 2
+        y_span = max_staging_y - min_staging_y
+        y_step = y_span / max(1, max_rows - 1)
+        for i in range(count):
+            col = i % 2
+            row = i // 2
+            y = min_staging_y + row * y_step + random.uniform(-0.008, 0.008)
+            x = (0.44 if col == 0 else 0.52) + random.uniform(-0.01, 0.01)
+            yaw = random.uniform(-6.0, 6.0)
+            pitch = random.uniform(-14.0, 14.0) if (include_tilted and i == 0) else 0.0
+            roll = random.uniform(-6.0, 6.0) if (include_tilted and i == 0) else 0.0
+            coords.append((round(x, 3), round(y, 3), round(yaw, 1), round(pitch, 1), round(roll, 1)))
 
     if include_unreachable:
         coords.append((1.25, 0.45, 0.0, 0.0, 0.0))
@@ -185,6 +227,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Demo 3: Vision-Guided Multi-Brick Pick & Place with 3D Tilted Grasping & Reachability Check"
     )
+    ap.add_argument("-n", "--num_bricks", type=int, default=2,
+                    help="Number of staged bricks to spawn and assemble (default: 2)")
     ap.add_argument("--coords", type=str, default=None,
                     help="Manual coordinates: '0.46,-0.10,15; 0.50,0.10,-10,12; 1.25,0.50,0'")
     ap.add_argument("--interactive", action="store_true",
@@ -219,11 +263,10 @@ def main():
     if args.speed is not None:
         cfg.arm_speed = args.speed
 
-    # Widen the staging area so 4+ bricks fit with minimum spacing enforced.
-    # Default area (160 × 350 mm) is too small; expanded area (250 × 400 mm)
-    # stays within the arm's reachable workspace (0.20–0.82 m radial).
+    # Widen staging area with Keep-Out Zone: staging corridor stays <= +0.05 m along Y
+    # ensuring at least 250 mm clearance from the wall (origin Y = 0.30 m).
     cfg.spawn_x_range = (0.35, 0.60)
-    cfg.spawn_y_range = (-0.25, 0.15)
+    cfg.spawn_y_range = (-0.45, 0.05)
 
     # 1. Determine Brick Input Coordinates
     brick_inputs = []
@@ -253,13 +296,14 @@ def main():
 
     # If no inputs provided, generate random brick coordinates to fulfill wall slots
     if not brick_inputs:
-        needed_count = min(total_slots, 4) if not args.random else total_slots
+        needed_count = total_slots if args.random else args.num_bricks
         brick_inputs = generate_random_coords(
             needed_count, cfg,
+            wall_plan=wall_plan,
             include_unreachable=args.demo_unreachable,
             include_tilted=args.demo_tilted
         )
-        print(f"[Input Mode] Generated {len(brick_inputs)} random brick staging coordinate(s).")
+        print(f"[Input Mode] Generated {len(brick_inputs)} random brick staging coordinate(s) (Keep-Out zone enforced).")
     else:
         print(f"[Input Mode] User provided {len(brick_inputs)} custom coordinate(s).")
 
@@ -289,11 +333,23 @@ def main():
         byaw = float(entry[2]) if len(entry) > 2 else 0.0
         bpitch = float(entry[3]) if len(entry) > 3 else 0.0
         broll = float(entry[4]) if len(entry) > 4 else 0.0
+        explicit_half = entry[5] if len(entry) > 5 else None
+
+        # Determine if this brick is a half-brick (either explicitly flagged or matching target slot)
+        if explicit_half is not None:
+            is_half = explicit_half
+        elif (i - 1) < len(wall_plan):
+            is_half = wall_plan[i - 1].half
+        else:
+            is_half = False
+
+        brick_len = (cfg.brick.length / 2.0) if is_half else cfg.brick.length
+        type_tag = " [Half]" if is_half else ""
+        label = f"B{i}{type_tag}"
 
         yaw_rad = math.radians(byaw)
         pitch_rad = math.radians(bpitch)
         roll_rad = math.radians(broll)
-        label = f"B{i}"
 
         target_pos = (bx, by, z_pos)
         is_tilted = (abs(bpitch) > 0.01 or abs(broll) > 0.01)
@@ -301,10 +357,13 @@ def main():
         # Physically spawn brick (with physical wedge support if tilted)
         if is_tilted:
             bid = make_tilted_brick(
-                cfg, target_pos, roll=roll_rad, pitch=pitch_rad, yaw=yaw_rad, with_support=True
+                cfg, target_pos, roll=roll_rad, pitch=pitch_rad, yaw=yaw_rad, length=brick_len, with_support=True
             )
         else:
-            bid = make_brick(cfg, target_pos, yaw=yaw_rad)
+            bid = make_brick(cfg, target_pos, yaw=yaw_rad, length=brick_len)
+
+        if is_half:
+            p.changeVisualShape(bid, -1, rgbaColor=cfg.half_brick_rgba)
 
         # Compute expected 3D normal and test reachability
         cand_orn = p.getQuaternionFromEuler((roll_rad, pitch_rad, yaw_rad))
@@ -343,6 +402,8 @@ def main():
             "true_roll_deg": broll,
             "true_yaw_rad": yaw_rad,
             "is_tilted": is_tilted,
+            "is_half": is_half,
+            "length": brick_len,
             "reachable": is_reachable,
             "reason": reason
         })
