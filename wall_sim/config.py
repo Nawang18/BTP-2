@@ -57,7 +57,7 @@ class Config:
     shuttle_deposit_stop: tuple = (0.74, -0.05)  # stop east of pedestal (>=40 mm
                                                   # clear of the brick edge), then
                                                   # teleport brick onto it
-    mortar_park: tuple = (1.05, 0.55, 0.35)
+    mortar_park: tuple = (-0.15, 0.48)      # ground position behind wall (x, y)
 
     # --- workspace bounds (for random brick spawning) -----------------------
     spawn_x_range: tuple = (0.40, 0.56)     # safe arm-reachable X range
