@@ -24,14 +24,15 @@ import pybullet as p
 
 from wall_sim.config import Config
 from wall_sim.scene import build_world, Pallet, make_pedestal, draw_slot_outline
-from wall_sim.wall_plan import plan_wall
+from wall_sim.structure_plan import (layout_to_specs, rectangular_layout,
+                                     validate_layout, render_ascii)
 from wall_sim.robots.panda_arm import PandaArm
 from wall_sim.robots.shuttle import Shuttle
 from wall_sim.robots.mortar_bot import MortarBot
 from wall_sim.robots.workers import ShuttleWorker, MortarWorker, ArmWorker
 from wall_sim.tasks.wall_dag import build_wall_dag
 from wall_sim.tasks.executor import Executor
-from wall_sim.brain.planner import llm_plan, parse_command
+from wall_sim.brain.planner import llm_plan, parse_command, PlanSpec
 from wall_sim.brain.world_state import WorldState
 from wall_sim.brain.tools import SiteContext
 from wall_sim.brain.supervisor import TacticalSupervisor
@@ -71,28 +72,33 @@ def main():
     print("=" * 60)
     print(f"  Command: \"{nl_command}\"")
 
-    if args.no_llm:
+    cfg = Config()
+    if args.rows is not None or args.bricks is not None:
+        spec = PlanSpec(rectangular_layout(args.bricks or 3, args.rows or 3), "cli")
+    elif args.no_llm:
         spec = parse_command(nl_command)
-        print("  Using deterministic parser (--no-llm)")
+        print("  Using offline parser (--no-llm)")
     else:
-        spec = llm_plan(nl_command)
+        spec = llm_plan(nl_command, cfg=cfg)
 
-    # CLI overrides
-    if args.rows is not None:
-        spec.rows = max(1, min(5, args.rows))
-    if args.bricks is not None:
-        spec.bricks_per_row = max(1, min(6, args.bricks))
+    errors = validate_layout(spec.layout, cfg)
+    if errors:
+        print("  Layout is not buildable:")
+        for err in errors:
+            print(f"    - {err}")
+        sys.exit(1)
 
-    print(f"  Plan: {spec.bricks_per_row} bricks/row × {spec.rows} rows "
-          f"({spec.bond_pattern} bond)")
+    print(f"  Plan: {spec.layout.description} "
+          f"({spec.layout.brick_count()} bricks, source: {spec.source})")
+    print(render_ascii(spec.layout))
 
     # ---- 3. Build the simulation world -------------------------------------
     print("\n" + "=" * 60)
     print("[Demo4] PHASE 2 — Setting up simulation")
     print("=" * 60)
 
-    cfg = Config(wall_bricks_per_row=spec.bricks_per_row,
-                 wall_rows=spec.rows)
+    cfg.wall_rows = spec.rows
+    cfg.wall_bricks_per_row = spec.bricks_per_row
     gui = not args.nogui
     cid = build_world(cfg, gui=gui)
 
@@ -103,7 +109,7 @@ def main():
     print("  Robots: Panda arm, shuttle cart, mortar cart — all loaded")
 
     # Wall plan
-    wall_specs = plan_wall(cfg)
+    wall_specs = layout_to_specs(spec.layout, cfg)
     total_bricks = len(wall_specs)
     print(f"  Wall plan: {total_bricks} bricks (including half-bricks)")
 

@@ -28,13 +28,14 @@ import pybullet as p
 
 from wall_sim.config import Config
 from wall_sim.scene import build_world, make_pedestal, draw_slot_outline, Pallet
-from wall_sim.wall_plan import plan_wall
+from wall_sim.structure_plan import (layout_to_specs, rectangular_layout,
+                                     validate_layout, render_ascii)
 from wall_sim.perception import VisionBackend, GroundTruthBackend
 from wall_sim.robots import PandaArm, Shuttle, MortarBot
 from wall_sim.robots.workers import ShuttleWorker, MortarWorker, VisionArmWorker
 from wall_sim.tasks import build_wall_dag, Executor
 from wall_sim.brain import (
-    llm_plan, WorldState, TacticalSupervisor, SiteContext
+    llm_plan, PlanSpec, WorldState, TacticalSupervisor, SiteContext
 )
 from wall_sim import metrics
 
@@ -64,14 +65,24 @@ def main():
     # Step 1: Layer 1 Strategic Planning (Command -> PlanSpec)
     # -----------------------------------------------------------------------
     print(f"\n[Layer 1: Strategic Planner] Processing user command:\n  \"{args.command}\"")
-    plan_spec = llm_plan(args.command, model=args.model)
-
     cfg = Config()
-    cfg.wall_rows = args.rows or plan_spec.rows
-    cfg.wall_bricks_per_row = args.bricks or plan_spec.bricks_per_row
+    if args.rows or args.bricks:
+        plan_spec = PlanSpec(rectangular_layout(args.bricks or 3, args.rows or 3), "cli")
+    else:
+        plan_spec = llm_plan(args.command, model=args.model, cfg=cfg)
 
-    print(f"[Layer 1 Output] PlanSpec: {cfg.wall_bricks_per_row} bricks/row, "
-          f"{cfg.wall_rows} rows ({plan_spec.bond_pattern} bond).")
+    errors = validate_layout(plan_spec.layout, cfg)
+    if errors:
+        print("[Layer 1] Layout is not buildable:")
+        for err in errors:
+            print(f"    - {err}")
+        sys.exit(1)
+
+    cfg.wall_rows = plan_spec.rows
+    cfg.wall_bricks_per_row = plan_spec.bricks_per_row
+    print(f"[Layer 1 Output] {plan_spec.layout.description} "
+          f"({plan_spec.layout.brick_count()} bricks, source: {plan_spec.source})")
+    print(render_ascii(plan_spec.layout))
 
     # -----------------------------------------------------------------------
     # Step 2: Physical World & Scene Construction
@@ -79,7 +90,7 @@ def main():
     print("\n[Simulation] Initializing PyBullet physics environment...")
     build_world(cfg, gui=not args.nogui)
 
-    plan = plan_wall(cfg)
+    plan = layout_to_specs(plan_spec.layout, cfg)
     for spec in plan:
         draw_slot_outline(spec, cfg)
     make_pedestal(cfg)

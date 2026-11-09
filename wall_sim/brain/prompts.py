@@ -4,46 +4,72 @@ Contains prompts for:
 - Layer 1 Strategic Planner: natural language user commands -> PlanSpec JSON
 - Layer 2 Tactical Supervisor: event-driven supervision, monitoring, error recovery
 """
+import json
 
 # ---------------------------------------------------------------------------
 # Layer 1: Strategic Planner Prompts
 # ---------------------------------------------------------------------------
 
-PLANNER_SYSTEM_PROMPT = """You are the strategic planning module of an autonomous construction robot brain.
-Your role is to translate high-level natural language requests into a concrete wall construction specification.
-
-Specification Schema (JSON only):
-{
-  "bricks_per_row": <int between 2 and 5>,
-  "rows": <int between 1 and 4>,
-  "bond_pattern": "running"
-}
-
-Rules:
-1. Output MUST be valid JSON with no markdown backticks, conversational preamble, or explanations.
-2. Standard rows have 'bricks_per_row' full bricks.
-3. Odd-numbered rows are automatically staggered with half-bricks (running bond). Do NOT modify bricks_per_row to reflect half-bricks.
-4. Default to bricks_per_row=3, rows=3 if the user is ambiguous or requests a 'standard wall'.
-"""
-
 PLANNER_FEW_SHOT_EXAMPLES = [
     {
-        "user": "Build a small test wall, 2 bricks wide and 2 rows high.",
-        "assistant": '{"bricks_per_row": 2, "rows": 2, "bond_pattern": "running"}'
+        "user": "Build a standard 3x2 wall.",
+        "assistant": {"description": "3-wide running bond wall, 2 rows", "rows": [
+            {"bricks": ["full", "full", "full"], "offset": 0},
+            {"bricks": ["half", "full", "full", "half"], "offset": 0}]},
     },
     {
-        "user": "Construct a standard 3x3 wall please.",
-        "assistant": '{"bricks_per_row": 3, "rows": 3, "bond_pattern": "running"}'
+        "user": "3 bricks at the bottom, then 2, then 1 on top, like a pedestal.",
+        "assistant": {"description": "3-2-1 pedestal, each row centred on the one below", "rows": [
+            {"bricks": ["full", "full", "full"], "offset": 0},
+            {"bricks": ["full", "full"], "offset": 1},
+            {"bricks": ["full"], "offset": 2}]},
     },
     {
-        "user": "I need a 4 wide by 3 high brick structure.",
-        "assistant": '{"bricks_per_row": 4, "rows": 3, "bond_pattern": "running"}'
+        "user": "A staircase going up to the right, 3 steps.",
+        "assistant": {"description": "3-step staircase rising to the right", "rows": [
+            {"bricks": ["full", "full", "full"], "offset": 0},
+            {"bricks": ["full", "full"], "offset": 2},
+            {"bricks": ["full"], "offset": 4}]},
     },
     {
-        "user": "Build 1 row of 3 bricks.",
-        "assistant": '{"bricks_per_row": 3, "rows": 1, "bond_pattern": "running"}'
-    }
+        "user": "A single pillar 3 bricks tall.",
+        "assistant": {"description": "single-brick pillar, 3 high (stack bond)", "rows": [
+            {"bricks": ["full"], "offset": 0},
+            {"bricks": ["full"], "offset": 0},
+            {"bricks": ["full"], "offset": 0}]},
+    },
 ]
+
+PLANNER_SYSTEM_PROMPT = """You design small brick structures that a robot team will build.
+The user describes what they want in plain words; you turn it into an exact row-by-row layout.
+
+How the site works:
+- Bricks are laid in rows along one straight line (a wall seen from the front). Row 0 is on the ground.
+- A "full" brick is 200 mm long; a "half" brick is 100 mm. There is a 5 mm mortar joint between bricks.
+- Each row lists its bricks from left to right, plus an integer "offset": how far the row starts from
+  the left end, in half-brick units (1 unit = half a full brick). offset 1 shifts a row by half a brick.
+- Every brick must rest at least half its length on the row below, with its centre over a brick
+  below. Otherwise it falls off.
+- Limits: at most 5 rows, at most 15 bricks, at most 4 full bricks per row (the arm cannot reach further).
+
+Patterns to know:
+- Ordinary wall ("3x2 wall", "3 bricks per row, 2 rows"): running bond. Even rows are N full bricks at
+  offset 0. Odd rows are half, N-1 full, half at offset 0, so the joints are staggered.
+- Pedestal / pyramid: each row has fewer full bricks and is centred on the row below. One brick fewer
+  means offset +1 compared with the row below.
+- Staircase: each row is shorter and aligned to one side.
+- Pillar / tower / column: one brick per row, same offset.
+If the user gives brick counts per row, follow them exactly. If they are vague, choose something sensible.
+
+Answer with JSON only, no markdown:
+{"description": "<short name of what you designed>",
+ "rows": [{"bricks": ["full", ...], "offset": <int>}, ...]}   (bottom row first)
+
+Examples:
+""" + "\n".join(
+    f"User: {ex['user']}\nAnswer: {json.dumps(ex['assistant'])}"
+    for ex in PLANNER_FEW_SHOT_EXAMPLES
+)
 
 
 # ---------------------------------------------------------------------------
