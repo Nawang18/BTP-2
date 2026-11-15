@@ -67,6 +67,19 @@ class Shuttle:
             yield from self._tick()
 
     # -- behaviour -----------------------------------------------------------
+    def home_gen(self):
+        """Return to the park position along the transit lanes. A no-op when
+        already parked. Every point of the delivery route can reach the east
+        lane by driving straight east, so this never crosses the stack or
+        the pedestal."""
+        park = np.array(self.cfg.shuttle_park, dtype=float)
+        if float(np.linalg.norm(self.pos - park)) < 0.01:
+            return
+        lx = self.cfg.shuttle_lane[0]
+        yield from self._go_gen(lx, self.pos[1])
+        yield from self._go_gen(lx, park[1])
+        yield from self._go_gen(park[0], park[1])
+
     def deliver_gen(self, brick_id, from_center, to_center):
         """Dock beside the stack, load, drive to handover, deposit, return.
 
@@ -79,6 +92,9 @@ class Shuttle:
         """
         cfg = self.cfg
         lx, ly = cfg.shuttle_lane
+        # 0. if a previous delivery was aborted mid-route, get back to the
+        #    park position along the lanes first (never cut across the site)
+        yield from self.home_gen()
         # 1. dock south of the stack (chassis clear of the bricks)
         dock_y = from_center[1] - cfg.shuttle_load_dock_offset
         yield from self._go_gen(from_center[0], dock_y)

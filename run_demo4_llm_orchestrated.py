@@ -124,7 +124,7 @@ def main():
     task_count = len(graph.tasks)
     print(f"  Task DAG: {task_count} tasks "
           f"({total_bricks} transport + {total_bricks} mortar + "
-          f"{total_bricks} place)")
+          f"{total_bricks} pick + {total_bricks} place)")
 
     # ---- 5. Workers + Executor ---------------------------------------------
     handover = {"body": None}

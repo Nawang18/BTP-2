@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .world_state import WorldState, BrickStatus
+from .world_state import WorldState
 from ..config import Config
 from ..perception import PerceptionInterface
 
@@ -112,10 +112,7 @@ class ToolRegistry:
                         "reason": "Task not found or not in FAILED state"}
             task = ctx.executor.graph.tasks[task_id]
             if task.brick is not None:
-                # a failed PLACE leaves the brick waiting on the pedestal
-                resume = (BrickStatus.AT_HANDOVER if task.kind == "PLACE"
-                          else BrickStatus.PLANNED)
-                ctx.world_state.on_task_retried(task_id, task.brick.brick_id, resume)
+                ctx.world_state.on_task_retried(task_id, task.brick.brick_id)
             ctx.world_state.on_robot_idle(task.robot)
             return {"status": "retried", "task_id": task_id}
 
@@ -132,6 +129,11 @@ class ToolRegistry:
             ctx.world_state.on_bricks_skipped(cancelled)
             ctx.world_state.open_failures.pop(task_id, None)
             ctx.world_state.on_robot_idle(task.robot)
+            # a skip can abort tasks other robots were running for those bricks
+            for robot in ctx.world_state.robot_status:
+                if (robot not in ctx.executor.running
+                        and ctx.world_state.robot_current_task.get(robot)):
+                    ctx.world_state.on_robot_idle(robot)
             return {"status": "skipped", "task_id": task_id,
                     "cancelled_bricks": cancelled}
 

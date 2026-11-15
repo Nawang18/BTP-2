@@ -134,7 +134,15 @@ class Executor:
 
         for bid in cancelled:
             for t in self.graph.tasks_for_brick(bid):
-                if t.status in (Status.PENDING, Status.FAILED):
+                if t.status is Status.RUNNING:
+                    # robots work concurrently, so another robot may be busy
+                    # with this brick right now (e.g. the shuttle fetching
+                    # it): abort that task too
+                    _, gen = self.running.pop(t.robot)
+                    gen.close()
+                    self._finish_task(t.robot, t, Status.SKIPPED)
+                    print(f"[executor] aborted running task {t.id}")
+                elif t.status in (Status.PENDING, Status.FAILED):
                     t.status = Status.SKIPPED
                     t.end_step = self.step
             for worker in self.workers.values():

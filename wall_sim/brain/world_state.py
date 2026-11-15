@@ -21,7 +21,7 @@ class BrickStatus(Enum):
     PLANNED = "planned"        # in the wall plan, not yet attempted
     IN_TRANSIT = "in_transit"  # shuttle is carrying it
     AT_HANDOVER = "at_handover"  # on the pedestal, waiting for arm
-    PLACING = "placing"        # arm is placing it
+    PLACING = "placing"        # arm is picking / carrying / placing it
     PLACED = "placed"          # successfully placed
     FAILED = "failed"          # a task for it failed; waiting for a decision
     SKIPPED = "skipped"        # given up on (or cancelled: nothing left to rest on)
@@ -108,6 +108,7 @@ class WorldState:
     def on_task_failed(self, brick_id: str, error: str,
                        task_id: Optional[str] = None, kind: str = "",
                        robot: str = "", attempts: int = 1):
+        stage = self.brick_status.get(brick_id, BrickStatus.PLANNED)
         if brick_id in self.brick_status:
             self.brick_status[brick_id] = BrickStatus.FAILED
         self.failed_bricks[brick_id] = error
@@ -116,14 +117,18 @@ class WorldState:
             self.open_failures[task_id] = {
                 "brick": brick_id, "kind": kind, "robot": robot,
                 "error": error, "attempts": attempts,
+                "stage_before_failure": stage.value,
             }
 
-    def on_task_retried(self, task_id: str, brick_id: str,
-                        resume_status: BrickStatus = BrickStatus.PLANNED):
-        self.open_failures.pop(task_id, None)
+    def on_task_retried(self, task_id: str, brick_id: str):
+        """A retry puts the brick back in the stage it was in when the task failed."""
+        failure = self.open_failures.pop(task_id, None) or {}
         self.failed_bricks.pop(brick_id, None)
-        if brick_id in self.brick_status:
-            self.brick_status[brick_id] = resume_status
+        if self.brick_status.get(brick_id) == BrickStatus.FAILED:
+            stage = failure.get("stage_before_failure", BrickStatus.PLANNED.value)
+            if stage == BrickStatus.FAILED.value:
+                stage = BrickStatus.PLANNED.value
+            self.brick_status[brick_id] = BrickStatus(stage)
 
     def on_bricks_skipped(self, brick_ids: List[str]):
         for bid in brick_ids:

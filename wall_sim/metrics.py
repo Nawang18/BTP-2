@@ -37,6 +37,46 @@ def print_summary(placements):
     print(f"max  |pos err|: {max(errs):.2f} mm")
 
 
+def coordination_summary(timeline):
+    """How well the robots overlapped, from the executor timeline.
+
+    makespan_s      : wall-clock (simulated) time from first start to last end
+    busy_s          : per robot, time spent executing tasks
+    utilisation     : per robot, busy time / makespan
+    total_work_s    : sum of all robots' busy time = how long the same tasks
+                      would take if the robots took turns
+    parallelism     : total_work_s / makespan_s (1.0 = strictly one robot at
+                      a time; higher = more overlap)
+    """
+    rows = [t for t in timeline if t["end_s"] > t["start_s"]]
+    if not rows:
+        return None
+    makespan = max(t["end_s"] for t in rows) - min(t["start_s"] for t in rows)
+    busy = {}
+    for t in rows:
+        busy[t["robot"]] = busy.get(t["robot"], 0.0) + t["end_s"] - t["start_s"]
+    total = sum(busy.values())
+    return {
+        "makespan_s": round(makespan, 1),
+        "busy_s": {r: round(b, 1) for r, b in busy.items()},
+        "utilisation": {r: round(b / makespan, 3) for r, b in busy.items()},
+        "total_work_s": round(total, 1),
+        "parallelism": round(total / makespan, 2),
+    }
+
+
+def print_coordination(timeline):
+    c = coordination_summary(timeline)
+    if not c:
+        return
+    print("\n=== coordination summary ===")
+    print(f"makespan      : {c['makespan_s']} s")
+    for robot, b in c["busy_s"].items():
+        print(f"{robot:<8} busy : {b:6.1f} s  ({c['utilisation'][robot]:.0%} of makespan)")
+    print(f"total work    : {c['total_work_s']} s if the robots took turns")
+    print(f"parallelism   : {c['parallelism']}x")
+
+
 def save_reports(placements, timeline, results_dir="results", tag="run"):
     os.makedirs(results_dir, exist_ok=True)
 

@@ -91,7 +91,7 @@ class TacticalSupervisor:
         if task.brick:
             if task.kind == "TRANSPORT":
                 ws.on_transport_start(task.brick.brick_id)
-            elif task.kind == "PLACE":
+            elif task.kind in ("PICK", "PLACE"):
                 ws.on_place_start(task.brick.brick_id)
 
     def _on_task_done(self, task_id: str, task: Any):

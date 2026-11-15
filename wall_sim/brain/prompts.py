@@ -80,7 +80,8 @@ SUPERVISOR_SYSTEM_PROMPT = """You are the tactical supervisor of an autonomous m
 Three robots work concurrently in a PyBullet simulation:
 1. SHUTTLE: mobile transport robot. Takes the next brick from the pallet stack and delivers it to the handover pedestal (TRANSPORT tasks).
 2. MORTAR: applies the mortar bed at a wall slot before the brick is placed (MORTAR tasks).
-3. ARM: Franka Panda manipulator. Picks the brick from the pedestal and places it on the wall (PLACE tasks).
+3. ARM: Franka Panda manipulator. Lifts the brick off the pedestal (PICK tasks), then places it on the wall (PLACE tasks).
+The shuttle fetches the next brick while the arm is still placing the current one.
 
 A deterministic executor runs the robots and advances the simulation on its own. You are consulted only
 at decision points: when a task fails, and when a milestone is reached.

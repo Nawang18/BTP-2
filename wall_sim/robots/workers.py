@@ -56,6 +56,10 @@ class ShuttleWorker:
         body_id, center = self.in_flight[bid]
 
         def gen():
+            if self.handover.get("body") is not None:
+                raise RuntimeError(
+                    f"handover pedestal is still occupied by brick "
+                    f"{self.handover.get('brick')}; cannot deliver {bid}")
             to = self.cfg.pedestal_brick_center()
             yield from self.shuttle.deliver_gen(body_id, center, to)
             self.handover["body"] = body_id
@@ -85,7 +89,9 @@ class MortarWorker:
 
 
 class ArmWorker:
-    kinds = {"PLACE"}
+    """PICK lifts the brick off the handover pedestal (freeing it for the
+    shuttle's next delivery); PLACE carries it to the wall."""
+    kinds = {"PICK", "PLACE"}
 
     # A brick is re-pickable only while it still rests on the pedestal.
     PEDESTAL_XY_TOL = 0.08
@@ -95,6 +101,7 @@ class ArmWorker:
         self.cfg, self.arm = cfg, arm
         self.handover = handover           # shared with ShuttleWorker
         self.placements = placements       # list of metric records
+        self.in_hand = None                # (body_id, brick_id) after a PICK
 
     def _pick_pose(self, nominal):
         """(centre, yaw) to grasp at. Base worker trusts the nominal pose."""
@@ -111,39 +118,57 @@ class ArmWorker:
                 f"it cannot be picked again")
 
     def begin(self, task: Task):
-        spec = task.brick
+        return self._pick_gen(task) if task.kind == "PICK" else self._place_gen(task)
 
-        def gen():
-            body = self.handover["body"]
-            if body is None:
-                raise RuntimeError(f"no brick on the handover pedestal for {spec.brick_id}")
-            if self.arm.held is not None:
-                # a previous attempt ended with the brick still in the gripper
-                self.arm.held = None
-                yield from self.arm.gripper_gen(self.cfg.gripper_open)
-                yield from self.arm.wait_gen(0.3)
-            self._check_on_pedestal(body, spec.brick_id)
-
-            from_center, pick_yaw = self._pick_pose(self.cfg.pedestal_brick_center())
-            yield from self.arm.pick_gen(body, from_center, yaw=pick_yaw)
-            yield from self.arm.place_gen(spec.center, yaw=spec.yaw)
-            self.handover["body"] = None
-            self.handover["brick"] = None
-            self.placements.append(metrics.record_placement(spec, body))
-
-        return gen()
-
-    def on_brick_skipped(self, brick_id):
+    def _pick_gen(self, task: Task):
+        bid = task.brick.brick_id
         body = self.handover.get("body")
-        if body is None or self.handover.get("brick", brick_id) != brick_id:
-            return
-        if self.arm.held == body:
+        if body is None or self.handover.get("brick", bid) != bid:
+            raise RuntimeError(f"brick {bid} is not on the handover pedestal")
+        if self.arm.held is not None:
+            # a previous attempt ended with a brick still in the gripper
             self.arm.held = None
-        self.arm._command_gripper(self.cfg.gripper_open)
-        p.removeBody(body)
+            yield from self.arm.gripper_gen(self.cfg.gripper_open)
+            yield from self.arm.wait_gen(0.3)
+        self._check_on_pedestal(body, bid)
+
+        from_center, pick_yaw = self._pick_pose(self.cfg.pedestal_brick_center())
+        yield from self.arm.pick_gen(body, from_center, yaw=pick_yaw)
+        # lifted clear: the brick is the arm's now and the pedestal is free
+        self.in_hand = (body, bid)
         self.handover["body"] = None
         self.handover["brick"] = None
-        print(f"[arm] discarded brick {brick_id} (cleared from the work area)")
+
+    def _place_gen(self, task: Task):
+        spec = task.brick
+        if self.in_hand is None or self.in_hand[1] != spec.brick_id:
+            raise RuntimeError(f"arm is not holding brick {spec.brick_id}")
+        body = self.in_hand[0]
+        if self.arm.held != body:
+            raise GripFailed(f"brick {spec.brick_id} is no longer in the gripper; "
+                             f"it cannot be placed")
+        yield from self.arm.place_gen(spec.center, yaw=spec.yaw)
+        self.in_hand = None
+        self.placements.append(metrics.record_placement(spec, body))
+
+    def on_brick_skipped(self, brick_id):
+        if self.in_hand is not None and self.in_hand[1] == brick_id:
+            body = self.in_hand[0]
+            self.in_hand = None
+            if self.arm.held == body:
+                self.arm.held = None
+            self.arm._command_gripper(self.cfg.gripper_open)
+            p.removeBody(body)
+            print(f"[arm] discarded brick {brick_id} from the gripper")
+        body = self.handover.get("body")
+        if body is not None and self.handover.get("brick") == brick_id:
+            if self.arm.held == body:
+                self.arm.held = None
+                self.arm._command_gripper(self.cfg.gripper_open)
+            p.removeBody(body)
+            self.handover["body"] = None
+            self.handover["brick"] = None
+            print(f"[arm] discarded brick {brick_id} from the pedestal")
 
 
 class VisionArmWorker(ArmWorker):

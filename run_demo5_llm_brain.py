@@ -17,6 +17,14 @@ Run:
     python run_demo5_llm_brain.py
     python run_demo5_llm_brain.py --command "Build a wall with 3 bricks per row and 2 rows" --nogui
     python run_demo5_llm_brain.py --command "Construct a 2x2 test wall"
+
+Testing failure recovery (make a task fail on purpose and watch the supervisor):
+    python run_demo5_llm_brain.py --inject-failure place:r0c1            # fails once -> retry
+    python run_demo5_llm_brain.py --inject-failure place:r0c1:always     # never works -> skip
+    python run_demo5_llm_brain.py --inject-failure transport:r1c0:2 --inject-failure mortar:r0c0
+
+Coordination baseline (robots take turns) to compare makespan against:
+    python run_demo5_llm_brain.py --sequential
 """
 import argparse
 import os
@@ -34,6 +42,7 @@ from wall_sim.perception import VisionBackend, GroundTruthBackend
 from wall_sim.robots import PandaArm, Shuttle, MortarBot
 from wall_sim.robots.workers import ShuttleWorker, MortarWorker, VisionArmWorker
 from wall_sim.tasks import build_wall_dag, Executor
+from wall_sim.tasks.fault_injection import parse_fault, install_faults
 from wall_sim.brain import (
     llm_plan, PlanSpec, WorldState, TacticalSupervisor, SiteContext
 )
@@ -55,7 +64,20 @@ def main():
     ap.add_argument("--no-vision", action="store_true", help="Use ground-truth perception instead of camera vision")
     ap.add_argument("--model", default="gemini-2.5-flash", help="Gemini model name")
     ap.add_argument("--offline", action="store_true", help="Force offline deterministic supervisor mode")
+    ap.add_argument("--sequential", action="store_true",
+                    help="Baseline: robots take turns (shuttle waits until the previous brick "
+                         "is placed). Default is the parallel plan, where the shuttle fetches "
+                         "the next brick while the arm is placing.")
+    ap.add_argument("--inject-failure", action="append", default=[], metavar="KIND:BRICK[:TIMES]",
+                    help="Make a task fail on purpose to test recovery, e.g. place:r0c1 "
+                         "(fails once), transport:r1c0:2, place:r0c1:always. "
+                         "KIND is transport, mortar, pick or place. Can be given more than once.")
     args = ap.parse_args()
+
+    try:
+        faults = [parse_fault(text) for text in args.inject_failure]
+    except ValueError as e:
+        ap.error(f"--inject-failure {e}")
 
     print("\n" + "=" * 70)
     print("DEMO 5: AUTONOMOUS MULTI-ROBOT WALL ASSEMBLY WITH 3-LAYER LLM BRAIN")
@@ -114,7 +136,8 @@ def main():
     # -----------------------------------------------------------------------
     # Step 4: Layer 3 Deterministic DAG & Robot Workers
     # -----------------------------------------------------------------------
-    graph = build_wall_dag(plan)
+    graph = build_wall_dag(plan, parallel=not args.sequential)
+    print(f"[TaskGraph] Plan: {'sequential baseline' if args.sequential else 'parallel'}")
     handover = {"body": None}
     placements = []
     workers = {
@@ -125,6 +148,17 @@ def main():
 
     executor = Executor(graph, workers, cfg)
     executor.halt_on_failure = False  # Allow supervisor to handle failures
+
+    if faults:
+        try:
+            install_faults(executor, faults)
+        except ValueError as e:
+            print(f"[Fault injection] {e}")
+            p.disconnect()
+            sys.exit(1)
+        for f in faults:
+            print(f"[Fault injection] {f.task_id} will fail "
+                  + ("every time" if f.times > 1000 else f"{f.times} time(s)"))
 
     # -----------------------------------------------------------------------
     # Step 5: World State & Layer 2 Tactical Supervisor
@@ -161,13 +195,24 @@ def main():
     total_tasks = len(graph.tasks)
     print(f"Tasks Completed: {tasks_done}/{total_tasks}")
 
+    recoveries = [d for d in supervisor.history if d.action in ("retry", "skip", "halt")]
+    if recoveries:
+        print("\n[Supervisor decisions]")
+        for d in recoveries:
+            print(f"  {d.action.upper():<5} {d.target_task or '':<18} "
+                  f"decided by {d.source.upper():<4} | {d.reason}")
+        if summary["skipped_bricks"]:
+            print(f"  Bricks left out of the wall: {', '.join(summary['skipped_bricks'])}")
+        print(f"  LLM calls used: {summary['llm_calls']}")
+
     if placements:
         metrics.print_summary(placements)
+        metrics.print_coordination(executor.timeline)
         metrics.save_reports(
             placements,
             executor.timeline,
             cfg.results_dir,
-            tag="demo5_llm_brain"
+            tag="demo5_sequential" if args.sequential else "demo5_llm_brain"
         )
         print(f"[Outputs] Visual reports & Gantt timeline written to: {cfg.results_dir}/")
 
