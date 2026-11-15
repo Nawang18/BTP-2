@@ -7,7 +7,7 @@ the DAG. Timeline data (who did what, when) is recorded for the Gantt report.
 
 Extended from the original with:
   - ``retry_task()``: resets a FAILED task back to PENDING for re-execution
-  - ``skip_task()``: marks a FAILED task as DONE to unblock downstream tasks
+  - ``skip_task()``: cancels the failed brick and any brick left unsupported
   - ``on_task_done`` / ``on_task_failed`` callbacks for the brain supervisor
   - ``run()`` no longer halts on first failure — it continues other robots
     and invokes the failure callback so the supervisor can decide
@@ -16,6 +16,7 @@ Extended from the original with:
 import pybullet as p
 
 from .task_graph import Status
+from ..structure_plan import unsupported_bricks
 
 
 class Executor:
@@ -30,6 +31,7 @@ class Executor:
         # Callbacks for brain supervisor integration.
         # Set these to functions that accept (task_id, task) or
         # (task_id, task, error_str) respectively.
+        self.on_task_start = None     # (task_id: str, task: Task) -> None
         self.on_task_done = None      # (task_id: str, task: Task) -> None
         self.on_task_failed = None    # (task_id: str, task: Task, error: str) -> None
 
@@ -38,10 +40,22 @@ class Executor:
         self.halt_on_failure = True   # legacy behaviour; supervisor sets False
 
     def _start_task(self, robot, task):
-        gen = self.workers[robot].begin(task)
-        task.status = Status.RUNNING
         task.start_step = self.step
+        try:
+            gen = self.workers[robot].begin(task)
+        except Exception as e:
+            # A worker that cannot even start (e.g. no brick to fetch) is a
+            # task failure the supervisor must see, not a crash of the loop.
+            print(f"[executor] task {task.id} FAILED to start: {e}")
+            self._finish_task(robot, task, Status.FAILED, str(e))
+            return
+        task.status = Status.RUNNING
         self.running[robot] = (task, gen)
+        if self.on_task_start:
+            try:
+                self.on_task_start(task.id, task)
+            except Exception as e:
+                print(f"[executor] on_task_start callback error: {e}")
 
     def _finish_task(self, robot, task, status, error_msg=None):
         task.status = status
@@ -87,19 +101,51 @@ class Executor:
         print(f"[executor] task {task_id} reset to PENDING for retry")
         return True
 
-    def skip_task(self, task_id: str) -> bool:
-        """Mark a FAILED task as DONE to unblock downstream tasks.
+    def skip_task(self, task_id: str):
+        """Give up on the brick a FAILED task belongs to.
 
-        This is for when the supervisor decides a failed brick should be
-        skipped rather than retried.  Returns True if successful.
+        Skipping one step of a brick makes no sense on its own (a brick that
+        was never delivered cannot be placed), so the whole brick is cancelled:
+        every unfinished task of it becomes SKIPPED. Bricks in the rows above
+        that would no longer be supported are cancelled with it, so the robots
+        never build over a hole.
+
+        Returns the list of cancelled brick ids (failed brick first), or an
+        empty list if the task wasn't found or wasn't in FAILED state.
         """
         task = self.graph.tasks.get(task_id)
         if task is None or task.status is not Status.FAILED:
-            return False
-        task.status = Status.DONE
-        task.end_step = self.step
-        print(f"[executor] task {task_id} marked DONE (skipped)")
-        return True
+            return []
+        if task.brick is None:
+            task.status = Status.SKIPPED
+            task.end_step = self.step
+            return []
+
+        specs = {t.brick.brick_id: t.brick
+                 for t in self.graph.tasks.values() if t.brick is not None}
+        missing = {bid for bid in specs
+                   if any(t.status is Status.SKIPPED
+                          for t in self.graph.tasks_for_brick(bid))}
+        failed_bid = task.brick.brick_id
+        missing.add(failed_bid)
+        lost = unsupported_bricks(list(specs.values()), missing,
+                                  self.cfg.brick.gap)
+        cancelled = [failed_bid] + sorted(lost)
+
+        for bid in cancelled:
+            for t in self.graph.tasks_for_brick(bid):
+                if t.status in (Status.PENDING, Status.FAILED):
+                    t.status = Status.SKIPPED
+                    t.end_step = self.step
+            for worker in self.workers.values():
+                hook = getattr(worker, "on_brick_skipped", None)
+                if hook:
+                    hook(bid)
+
+        print(f"[executor] brick {failed_bid} skipped"
+              + (f"; also cancelled (no support left): {', '.join(sorted(lost))}"
+                 if lost else ""))
+        return cancelled
 
     # -- main loop -----------------------------------------------------------
 

@@ -135,15 +135,45 @@ def validate_layout(layout: Layout, cfg: Config):
                           f"(limit {ARM_REACH} m) -- row too long or offset too large")
 
     for r in range(1, len(layout.rows)):
-        below = _merged_spans(by_row[r - 1], cfg.brick.gap)
         for s in by_row[r]:
-            lo, hi = s.center[0] - s.length / 2.0, s.center[0] + s.length / 2.0
-            overlap = sum(max(0.0, min(hi, b) - max(lo, a)) for a, b in below)
-            centred = any(a <= s.center[0] <= b for a, b in below)
-            if overlap < MIN_SUPPORT * s.length or not centred:
-                errors.append(f"brick {s.brick_id} is only {overlap / s.length:.0%} "
+            ok, frac = _support(s, by_row[r - 1], cfg.brick.gap)
+            if not ok:
+                errors.append(f"brick {s.brick_id} is only {frac:.0%} "
                               f"supported by row {r - 1} -- it would fall off")
     return errors
+
+
+def _support(spec, below_specs, gap):
+    """(is_supported, supported_fraction) of a brick resting on `below_specs`."""
+    below = _merged_spans(below_specs, gap)
+    lo, hi = spec.center[0] - spec.length / 2.0, spec.center[0] + spec.length / 2.0
+    overlap = sum(max(0.0, min(hi, b) - max(lo, a)) for a, b in below)
+    centred = any(a <= spec.center[0] <= b for a, b in below)
+    return (overlap >= MIN_SUPPORT * spec.length and centred), overlap / spec.length
+
+
+def unsupported_bricks(specs, missing_ids, gap):
+    """Brick ids that can no longer be built once `missing_ids` are absent.
+
+    Walks the rows bottom-up: a brick is lost if the bricks that will really
+    exist in the row below no longer carry it. Losses propagate upward, so one
+    missing brick can take out a whole column above it. The result does not
+    include `missing_ids` themselves.
+    """
+    by_row = {}
+    for s in specs:
+        by_row.setdefault(s.row, []).append(s)
+    gone = set(missing_ids)
+    lost = set()
+    for r in sorted(by_row)[1:]:
+        below = [s for s in by_row.get(r - 1, []) if s.brick_id not in gone]
+        for s in by_row[r]:
+            if s.brick_id in gone:
+                continue
+            if not below or not _support(s, below, gap)[0]:
+                gone.add(s.brick_id)
+                lost.add(s.brick_id)
+    return lost
 
 
 def render_ascii(layout: Layout) -> str:
