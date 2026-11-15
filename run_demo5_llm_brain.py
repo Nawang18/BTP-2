@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--bricks", type=int, default=None, help="Override bricks per row")
     ap.add_argument("--nogui", action="store_true", help="Run headless in DIRECT mode")
     ap.add_argument("--no-vision", action="store_true", help="Use ground-truth perception instead of camera vision")
-    ap.add_argument("--model", default="gemini-2.5-flash", help="Gemini model name")
+    ap.add_argument("--model", default="gemini-3.5-flash", help="Gemini model name")
     ap.add_argument("--offline", action="store_true", help="Force offline deterministic supervisor mode")
     ap.add_argument("--sequential", action="store_true",
                     help="Baseline: robots take turns (shuttle waits until the previous brick "

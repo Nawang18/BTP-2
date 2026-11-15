@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .prompts import PLANNER_SYSTEM_PROMPT
+from .env import load_env
 from ..config import Config
 from ..structure_plan import (Layout, rectangular_layout, centered_layout,
                               validate_layout)
@@ -62,12 +63,16 @@ def parse_command(text: str) -> PlanSpec:
     return PlanSpec(rectangular_layout(3, 3), "fallback")
 
 
+GEMINI_TIMEOUT_MS = 90_000  # complex layouts can take 30+ s to design
+
+
 def llm_plan(text: str,
-             model: str = "gemini-2.5-flash",
+             model: str = "gemini-3.5-flash",
              api_key: Optional[str] = None,
              cfg: Optional[Config] = None,
              max_attempts: int = 3) -> PlanSpec:
     cfg = cfg or Config()
+    load_env()
     resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not resolved_key:
         print("[Brain Planner] GEMINI_API_KEY not set; using the offline parser.")
@@ -75,7 +80,8 @@ def llm_plan(text: str,
 
     try:
         from google import genai
-        client = genai.Client(api_key=resolved_key)
+        client = genai.Client(api_key=resolved_key,
+                              http_options={"timeout": GEMINI_TIMEOUT_MS})
     except Exception as e:
         print(f"[Brain Planner] Gemini unavailable ({e}); using the offline parser.")
         return parse_command(text)
@@ -88,6 +94,11 @@ def llm_plan(text: str,
                 contents=prompt,
                 config={"response_mime_type": "application/json", "temperature": 0.2},
             )
+        except Exception as e:
+            # API/network problem (timeout, bad model name, quota): retrying won't help
+            print(f"[Brain Planner] Gemini request failed ({e}); using the offline parser.")
+            return parse_command(text)
+        try:
             raw = response.text.strip()
             layout = Layout.from_dict(json.loads(raw))
             errors = validate_layout(layout, cfg)

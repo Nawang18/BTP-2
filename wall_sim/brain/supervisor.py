@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .world_state import WorldState, BrickStatus
 from .tools import ToolRegistry, SiteContext
 from .prompts import SUPERVISOR_SYSTEM_PROMPT
+from .env import load_env
 from ..tasks.task_graph import Status
 
 FAILURE_TOOLS = ("get_world_state", "get_perception", "retry_task",
@@ -42,7 +43,7 @@ class TacticalSupervisor:
 
     def __init__(self,
                  context: SiteContext,
-                 model: str = "gemini-2.5-flash",
+                 model: str = "gemini-3.5-flash",
                  use_llm: bool = True,
                  max_retries_per_task: int = 2,
                  max_llm_turns: int = 4):
@@ -72,11 +73,13 @@ class TacticalSupervisor:
     def _init_llm_client(self):
         if not self.use_llm:
             return
+        load_env()
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         try:
             from google import genai
             if api_key:
-                self.client = genai.Client(api_key=api_key)
+                self.client = genai.Client(api_key=api_key,
+                                           http_options={"timeout": 30_000})
                 print(f"[Supervisor] Gemini API ready (model: {self.model_name})")
             else:
                 print("[Supervisor] GEMINI_API_KEY not set — running deterministic mode.")

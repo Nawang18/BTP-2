@@ -46,11 +46,9 @@ generators (one yield per simulation step, no threads).
 ```bash
 pip install -r requirements.txt
 
-# Set your Gemini API key (free tier works fine)
-# On Windows:
-set GEMINI_API_KEY=your_key_here
-# On Linux/Mac:
-export GEMINI_API_KEY=your_key_here
+# Put your Gemini API key in a .env file in the project root (gitignored):
+#   GEMINI_API_KEY=your_key_here
+# The demos load it automatically. A key set in the environment also works.
 ```
 
 ### Demo 4 — Full LLM-orchestrated multi-robot build (the main one)
