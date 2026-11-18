@@ -27,6 +27,7 @@ class Executor:
         self.step = 0
         self.running = {}             # robot -> (task, generator)
         self.timeline = []
+        self.tick_hooks = []          # callables(step), run after each sim step
 
         # Callbacks for brain supervisor integration.
         # Set these to functions that accept (task_id, task) or
@@ -182,6 +183,8 @@ class Executor:
 
         self.step += 1
         p.stepSimulation()
+        for hook in self.tick_hooks:
+            hook(self.step)
 
     def run(self, max_steps=None):
         limit = max_steps or int(1e9)

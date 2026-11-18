@@ -80,7 +80,7 @@ class Shuttle:
         yield from self._go_gen(lx, park[1])
         yield from self._go_gen(park[0], park[1])
 
-    def deliver_gen(self, brick_id, from_center, to_center):
+    def deliver_gen(self, brick_id, from_center, to_center, to_yaw=0.0):
         """Dock beside the stack, load, drive to handover, deposit, return.
 
         Routing rule: the chassis is solid, so its swept area must never
@@ -118,7 +118,7 @@ class Shuttle:
         # 4. deposit: brick teleports onto the pedestal, shuttle releases
         p.resetBasePositionAndOrientation(
             brick_id, (to_center[0], to_center[1], to_center[2]),
-            (0, 0, 0, 1))
+            p.getQuaternionFromEuler((0.0, 0.0, to_yaw)))
         p.resetBaseVelocity(brick_id, (0, 0, 0), (0, 0, 0))
         self.carrying = None
         yield from self._wait_gen(0.2)
